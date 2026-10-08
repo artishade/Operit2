@@ -3748,7 +3748,13 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsRuntimeControlAssignIdentity => '设置设备身份';
 
   @override
-  String get settingsRuntimeControlClearIdentity => '清除设备身份';
+  String get settingsRuntimeControlClearIdentity => '重置为默认身份';
+
+  @override
+  String get settingsRuntimeControlDeviceAdmitted => '已解除连接限制，等待设备重连';
+
+  @override
+  String get settingsRuntimeControlIdentityResetDone => '身份已重置为默认用户';
 
   @override
   String get settingsRuntimeControlIdentityDefinitions => '身份定义';
@@ -4141,6 +4147,9 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get spaceJoinCancel => '取消申请';
+
+  @override
+  String get spaceJoinCancelFailed => '未能确认申请已取消，请检查连接或稍后重试。';
 
   @override
   String get spaceJoinRefreshingFailed => '暂时无法联系设备。申请已保留，会继续重试。';

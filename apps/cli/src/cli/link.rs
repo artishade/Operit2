@@ -201,6 +201,7 @@ async fn execute_link_session_command(application: &operit_core_application::Cor
     match args.first().map(String::as_str) {
         Some("space") => execute_link_space_command(application, &args[1..]).await,
         Some("control") => execute_link_control_command(application, &args[1..]).await,
+        Some("edge-plugin") => execute_link_edge_plugin_command(application, &args[1..]).await,
         Some("token") if args.len() == 2 && args[1] == "show" => {
             let token = application.localPairingToken()?;
             if cli_json_mode() { emit_cli_json(serde_json::json!({"token": token})); }
@@ -302,13 +303,30 @@ async fn execute_node_pairing_command(
 }
 
 async fn run_link_edge_plugin_command(args: &[String]) -> Result<(), String> {
+    let application = create_cli_core_application_without_space_sync("client").await?;
+    let result = execute_link_edge_plugin_command(&application, args).await;
+    application.shutdown().await;
+    result
+}
+
+async fn execute_link_edge_plugin_command(coreApplication: &operit_core_application::CoreApplication, args: &[String]) -> Result<(), String> {
     const USAGE: &str = "usage: operit2 cli link edge-plugin <device> <list|invoke <plugin-id> <action> [json-args]>";
     let device = args.first().ok_or(USAGE)?;
-    let coreApplication = create_cli_core_application("client").await?;
     let topology = coreApplication.accessServices().deviceSpaceTopology()?;
     let deviceId = network_device_id(&topology, device)?;
-    let client =
-        operit_node_runtime::NodeClient::NodeClient::new(coreApplication.nodeRouter(), deviceId);
+    // Restored credentials are not yet an authenticated online route. Give the
+    // runtime's existing availability worker time to establish it; do not bypass
+    // routing/Space policy or depend on the business persistence sync worker.
+    let router = coreApplication.nodeRouter();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let peers = coreApplication.nodeServices()?.peers();
+        let mut changes = peers.subscribePeerChanges();
+        loop {
+            if router.nodeIsReachable(&deviceId)? { return Ok::<_, String>(()); }
+            changes.recv().await.map_err(|error| error.to_string())?;
+        }
+    }).await.map_err(|_| format!("Device did not become reachable: {deviceId}"))??;
+    let client = operit_node_runtime::NodeClient::NodeClient::new(router, deviceId);
     let mut proxy = operit_proxy_edge::EdgeProxy::new(client);
     let json: serde_json::Value = match args.get(1).map(String::as_str) {
         Some("list") if args.len() == 2 => serde_json::to_value(
@@ -709,7 +727,7 @@ fn run_link_control_identity_command(
             if cli_json_mode() {
                 emit_cli_json(serde_json::json!({ "deviceId": deviceId, "cleared": true }));
             } else {
-                println!("Cleared identity from \"{deviceName}\"");
+                println!("Reset identity of \"{deviceName}\" to the default user");
             }
             Ok(())
         }
@@ -970,7 +988,7 @@ fn find_core_stream_descriptor(value: &CoreValue) -> Option<CoreStreamDescriptor
 }
 
 /// Prints Link command usage in the selected output format.
-fn print_link_usage() {
+pub(crate) fn print_link_usage() {
     if cli_json_mode() {
         emit_cli_json(
             serde_json::json!({ "usage": "operit2 cli link <discover|token|pair-start|pair-finish|pair-cancel|unpair|peers|listen|session|space|control|stream-probe|edge-plugin>" }),

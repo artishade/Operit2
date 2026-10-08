@@ -19,7 +19,7 @@ impl HostRuntimePeerService {
         let storage = self.state.host.runtimeStorageHost.clone()
             .ok_or_else(|| error("Runtime storage Host is not installed"))?;
         if NetworkControlStore::new(storage).map_err(error)?.nodeIsDisconnected(node).map_err(error)? {
-            return Err(CoreLinkError::new("PEER_CONNECTION_REVOKED", "Peer is disconnected or removed by current Space policy"));
+            return Err(CoreLinkError::new("PEER_CONNECTION_REVOKED", "Peer is disconnected by current Space policy"));
         }
         Ok(())
     }
@@ -77,7 +77,7 @@ impl HostRuntimePeerService {
                             }
                             if connecting.contains(&peer.nodeId) || service.hasLiveChannel(&peer.nodeId) { continue; }
                             if !(peer.outbound || service.spaceOutbound(&peer.nodeId).is_ok()) { continue; }
-                            if connecting.len() >= MAX_CONNECTING_PEERS { break; }
+                            if connecting.len() >= MAX_CONNECTING_PEERS.min(service.state.limits.concurrentProbes) { break; }
                             let node = peer.nodeId;
                             lastPeer = Some(node.clone());
                             connecting.insert(node.clone());
@@ -109,4 +109,19 @@ impl HostRuntimePeerService {
             let _ = done.await;
         }
     }
+}
+
+/// Established reusable sessions use the channel's own bounded exchange. This
+/// keeps correlation, cancellation safety and close-on-timeout in one place.
+pub(super) async fn probeConnectedSession(channel: &Channel) -> Result<(), CoreLinkError> {
+    if channel.duplex().is_some() {
+        let id = nextCoreRouteRequestId("serial-ping");
+        match channel.exchange(CoreLinkRequest::Call(CoreCallRequest::new(
+            id.clone(), "$peer.keepalive", "ping", CoreValue::Null,
+        ))).await? {
+            CoreLinkResponse::Call(CoreCallResponse { requestId, result: Ok(CoreValue::Null) }) if requestId.0 == id => {},
+            _ => { channel.close().await; return Err(error("Serial keepalive response mismatch")); }
+        }
+    }
+    Ok(())
 }

@@ -1,7 +1,5 @@
 #[path = "core/app.rs"]
 mod app;
-#[path = "core/approval.rs"]
-mod approval;
 #[path = "input/commands.rs"]
 mod commands;
 #[path = "compose/mod.rs"]
@@ -24,6 +22,8 @@ mod input;
 mod link_proxy_rs;
 #[path = "transcript/markdown.rs"]
 mod markdown;
+#[path = "core/outgoing_joins.rs"]
+mod outgoing_joins;
 #[path = "input/pending_queue.rs"]
 mod pending_queue;
 #[path = "view/render.rs"]
@@ -41,19 +41,26 @@ mod typewriter;
 
 use app::{
     FullUpdateDownloadState, OperitTui, StartupInstallPrompt, StartupInstallState,
-    StartupUpdatePrompt,
+    StartupUpdatePrompt, parse_peer_transport,
 };
-use approval::TuiApprovalBridge;
 use i18n::TuiLanguage;
 use link_proxy_rs::tui_core;
-use operit_node_runtime::NodeServices::PeerTransport;
+use operit_node_runtime::NodeServices::{PairingPrompt, PeerTransport};
+use operit_node_runtime::RuntimeRemoteLinkService::{RuntimeRemoteLinkService, SpaceJoinRequest};
 use operit_node_runtime::RuntimePeerService::RuntimePeerService;
 use operit_core_application::CoreApplication;
 use operit_providers::chat::enhance::ConversationService::ConversationService;
 use operit_providers::chat::EnhancedAIService::EnhancedAIService;
 use operit_runtime::core::chat::ChatRuntimeSlot::ChatRuntimeSlot;
 use operit_runtime::data::preferences::ApiPreferences::ApiPreferences;
+use operit_runtime::services::RuntimeHostInteractionService::{
+    requestChatToolPermissionAsync, RuntimeHostInteractionToolPermissionTool,
+    RuntimeHostInteractionToolPermissionToolParameter,
+};
 use operit_tools::tools::AIToolHandler::AIToolHandler;
+use operit_tools::tools::ToolPermissionSystem::PermissionRequestResult;
+use operit_tools::ToolExecutionManager::AITool;
+use operit_util::AppLogger::AppLogger;
 use operit_util::GithubReleaseUtil::{FullUpdateStatus, FullUpdateTarget, GithubReleaseUtil};
 use std::fs;
 use std::io::{self, Write};
@@ -79,14 +86,12 @@ pub(crate) async fn run_tui_command(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let (shell_args, link_args) = parse_tui_startup_args(args)?;
-    let approval_bridge = TuiApprovalBridge::new();
     let initial_chat_id_cell = Arc::new(StdMutex::new(None::<String>));
     let language_cell = Arc::new(StdMutex::new(None::<TuiLanguage>));
     let (toast_sender, toast_receiver) = mpsc::channel::<String>();
     let toast_host = tui_toast_host(toast_sender);
     let (network_event_sender, network_event_receiver) = mpsc::channel::<NetworkUiEvent>();
     let shell_args_for_core = shell_args.clone();
-    let approval_bridge_for_core = approval_bridge.clone();
     let initial_chat_id_for_core = initial_chat_id_cell.clone();
     let language_for_core = language_cell.clone();
     let core_application = create_cli_core_application_configured_with_toast_host(
@@ -99,7 +104,7 @@ pub(crate) async fn run_tui_command(args: &[String]) -> Result<(), String> {
             };
             let initial_chat_id =
                 initialize_shell_chat(local_core.localApplicationMut(), &shell_args_for_core)?;
-            install_local_permission_requester(local_core, approval_bridge_for_core);
+            install_local_permission_requester(local_core);
             *language_for_core
                 .lock()
                 .expect("TUI language cell lock must not be poisoned") = Some(language);
@@ -120,10 +125,7 @@ pub(crate) async fn run_tui_command(args: &[String]) -> Result<(), String> {
         .expect("TUI language cell lock must not be poisoned")
         .take()
         .expect("TUI language must be initialized by CoreApplication startup");
-    let network_event_task = spawn_network_ui_events(
-        core_application.nodeServices()?.peers(),
-        network_event_sender,
-    );
+    let network_peers = core_application.nodeServices()?.peers();
     let initial_chat_id = initial_chat_id_cell
         .lock()
         .expect("TUI initial chat cell lock must not be poisoned")
@@ -147,7 +149,6 @@ pub(crate) async fn run_tui_command(args: &[String]) -> Result<(), String> {
         core_application.accessServices(),
         shell_args,
         initial_chat_id,
-        approval_bridge,
         language,
         startup_install_prompt,
         startup_update_prompt,
@@ -156,29 +157,53 @@ pub(crate) async fn run_tui_command(args: &[String]) -> Result<(), String> {
         network_event_receiver,
     )
     .await?;
-    let result = tui.run().await;
+    // Runtime peer/proxy futures are not Send. Keep the monitor on the local
+    // executor, independently of the terminal loop, and drop its in-flight
+    // operations before shutting down the Core.
+    let result = tokio::task::LocalSet::new()
+        .run_until(async {
+            let network_event_task = spawn_network_ui_events(
+                network_peers,
+                core_application.accessServices(),
+                network_event_sender.clone(),
+            );
+            let outgoing_join_task = outgoing_joins::spawn_outgoing_join_monitor(
+                core_application.accessServices(),
+                network_event_sender,
+            );
+            let result = tui.run().await;
+            outgoing_join_task.abort();
+            network_event_task.abort();
+            let _ = outgoing_join_task.await;
+            let _ = network_event_task.await;
+            result
+        })
+        .await;
     drop(tui);
-    network_event_task.abort();
     core_application.shutdown().await;
     result
 }
 
 /// Structured network events the watcher pushes to the TUI event loop.
 pub(crate) enum NetworkUiEvent {
-    /// The peer service signaled a change. Carries no data on purpose: the
-    /// link proxy futures are not `Send`, so the TUI event loop fetches the
-    /// pairing prompt and join request snapshots itself.
-    PeerChanges,
+    /// A background refresh reached a terminal join status. Applying this
+    /// event must not perform another remote call on the terminal loop.
+    OutgoingJoinSettled(SpaceJoinRequest),
+    /// Snapshots fetched in the background after peer changes or a settled join.
+    Snapshot {
+        prompts: Vec<PairingPrompt>,
+        requests: Option<Vec<SpaceJoinRequest>>,
+    },
 }
 
-/// Forwards peer-service change signals to the TUI event loop. The signal
-/// carries no payload; the TUI diffs fresh snapshots against what it has
-/// shown, so nothing polls on a timer.
+/// Fetches change-triggered snapshots off the terminal loop. Peer futures are
+/// not Send, so this watcher shares the local executor with the join monitor.
 fn spawn_network_ui_events(
     peers: Arc<dyn RuntimePeerService>,
+    network: RuntimeRemoteLinkService,
     events: mpsc::Sender<NetworkUiEvent>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    tokio::task::spawn_local(async move {
         let mut changes = peers.subscribePeerChanges();
         loop {
             match changes.recv().await {
@@ -188,7 +213,10 @@ fn spawn_network_ui_events(
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
-            if events.send(NetworkUiEvent::PeerChanges).is_err() {
+            if events
+                .send(outgoing_joins::network_snapshot(&network).await)
+                .is_err()
+            {
                 break;
             }
         }
@@ -220,14 +248,10 @@ fn parse_tui_startup_args(args: &[String]) -> Result<(ShellArgs, TuiLinkStartupA
         match args[index].as_str() {
             "--link-listen" => {
                 index += 1;
-                link_args.listen = Some(match args.get(index).map(String::as_str) {
-                    Some("http") => PeerTransport::Http,
-                    Some("ws") => PeerTransport::WebSocket,
-                    Some("tcp") => PeerTransport::Tcp,
-                    Some("serial") => PeerTransport::Serial,
-                    Some("bluetooth") => PeerTransport::Bluetooth,
-                    _ => return Err(usage.to_string()),
-                });
+                link_args.listen = Some(
+                    parse_peer_transport(args.get(index).map(String::as_str).unwrap_or_default())
+                        .map_err(|_| usage.to_string())?,
+                );
             }
             "--link-join" => {
                 index += 1;
@@ -316,19 +340,59 @@ async fn build_startup_update_prompt(
     }
 }
 
-fn install_local_permission_requester(
-    core: &mut operit_proxy_local::LocalCoreProxy,
-    approval_bridge: TuiApprovalBridge,
-) {
+/// Installs the chat-scoped permission requester so tool approvals become
+/// chat state that every reader of the chat can see and answer, matching the
+/// Flutter bridge and the headless CLI.
+fn install_local_permission_requester(core: &mut operit_proxy_local::LocalCoreProxy) {
     let handler = core.localApplicationMut().toolHandler.clone();
     handler
         .getToolPermissionSystem()
-        .setAsyncPermissionRequester(move |tool, description, _chatId| {
-            let approval_bridge = approval_bridge.clone();
-            async move {
-                tokio::task::spawn_blocking(move || approval_bridge.request(&tool, &description))
-                    .await
-                    .expect("tool approval task failed")
+        .setAsyncPermissionRequester(move |tool, description, chatId| async move {
+            let Some(chatId) = chatId else {
+                return PermissionRequestResult::DENY;
+            };
+            let response = match requestChatToolPermissionAsync(
+                chatId,
+                tool_to_permission_payload(&tool),
+                description,
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    AppLogger::e(
+                        "TuiApproval",
+                        &format!("permission request failed: {error}"),
+                    );
+                    return PermissionRequestResult::DENY;
+                }
+            };
+            match response.as_str() {
+                "allow" => PermissionRequestResult::ALLOW,
+                "allow_session" => PermissionRequestResult::ALLOW_SESSION,
+                "deny" => PermissionRequestResult::DENY,
+                other => {
+                    AppLogger::e("TuiApproval", &format!("unknown permission result: {other}"));
+                    PermissionRequestResult::DENY
+                }
             }
         });
+}
+
+/// Converts a typed tool into the chat permission request schema.
+fn tool_to_permission_payload(tool: &AITool) -> RuntimeHostInteractionToolPermissionTool {
+    RuntimeHostInteractionToolPermissionTool {
+        name: tool.name.clone(),
+        parameters: tool
+            .parameters
+            .iter()
+            .map(
+                |parameter| RuntimeHostInteractionToolPermissionToolParameter {
+                    name: parameter.name.clone(),
+                    value: parameter.value.clone(),
+                },
+            )
+            .collect(),
+    }
 }
