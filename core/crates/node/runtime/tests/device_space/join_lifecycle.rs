@@ -353,3 +353,232 @@ async fn lost_submission_reply_reuses_request_and_does_not_duplicate_receiver_in
         1
     );
 }
+
+/// Exercises a target advertising the applicant's own space identity without
+/// the applicant as a member: the join attempt reconciles both control logs,
+/// retires the stale local membership when the converged policy excludes this
+/// device, and then applies as the independent Space it now is, on the same
+/// attempt.
+#[tokio::test]
+async fn join_request_retires_stale_membership_and_applies_as_its_own_space() {
+    let _guard = routeTestGlobalLock().lock().await;
+    installTestRuntimeScheduler();
+    let pair = IndependentPair::new("split-join");
+    // Diverge the member tables on one shared space identity: the applicant's
+    // projection carries the receiver's space identity while the receiver's own
+    // snapshot still lists only itself, so neither side admits the applicant.
+    let receiverSpace = pair.b.spaceStore.space().unwrap();
+    pair.a
+        .spaceStore
+        .adopt(operit_store::CoreSpaceStore::CoreSpace {
+            spaceId: receiverSpace.spaceId.clone(),
+            spaceName: receiverSpace.spaceName.clone(),
+            spaceRevision: receiverSpace.spaceRevision + 1,
+            members: vec![pair.a.localNodeId()],
+        })
+        .unwrap();
+    let request = pair
+        .applicant
+        .requestDeviceSpaceJoin(pair.b.localNodeId())
+        .await
+        .expect("the retired applicant applies as its own Space on the same attempt");
+    assert_eq!(request.targetDeviceId, pair.b.localNodeId());
+    // The stale membership was retired exactly like an explicit leave before
+    // the request was built, so the application carries a clean single-device
+    // source instead of the divergent projection.
+    assert_ne!(
+        pair.a.spaceStore.space().unwrap().spaceId,
+        receiverSpace.spaceId
+    );
+    assert_eq!(
+        pair.a.spaceStore.space().unwrap().members,
+        vec![pair.a.localNodeId()]
+    );
+    // The merged log excludes this device but keeps the shared history for
+    // any later review.
+    let merged = pair
+        .a
+        .networkControlStore
+        .spaceOperations(&receiverSpace.spaceId)
+        .unwrap();
+    assert!(merged
+        .iter()
+        .any(|operation| operation.originDeviceId == pair.b.localNodeId()));
+    // The receiver sees the application and its own Space stays untouched.
+    assert_eq!(protocolRecords(&pair.b, INBOUND_RECORDS).len(), 1);
+    assert_eq!(
+        pair.receiver.incomingDeviceSpaceJoins().await.unwrap().len(),
+        1
+    );
+    assert_eq!(
+        pair.b.spaceStore.space().unwrap().members,
+        vec![pair.b.localNodeId()]
+    );
+}
+
+/// Exercises reconciliation restores both replicas when the shared control log
+/// admits the applicant: records, profiles and policy converge without any
+/// fresh admission command.
+#[tokio::test]
+async fn reconciliation_restores_members_the_shared_log_admits() {
+    let _guard = routeTestGlobalLock().lock().await;
+    installTestRuntimeScheduler();
+    let pair = IndependentPair::new("reconcile-restore");
+    // The shared Space's policy already admits the applicant; only its record
+    // projection forked away from the shared identity.
+    pair.b
+        .networkControlStore
+        .admitMember(pair.a.localNodeId())
+        .unwrap();
+    let shared = pair.b.spaceStore.space().unwrap();
+    pair.a
+        .spaceStore
+        .adopt(operit_store::CoreSpaceStore::CoreSpace {
+            spaceId: shared.spaceId.clone(),
+            spaceName: shared.spaceName.clone(),
+            spaceRevision: shared.spaceRevision + 1,
+            members: vec![pair.a.localNodeId()],
+        })
+        .unwrap();
+    let error = pair
+        .applicant
+        .requestDeviceSpaceJoin(pair.b.localNodeId())
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("already a member"),
+        "unexpected error: {error}"
+    );
+    // Both replicas converge on one log: member records, profiles and policy
+    // agree, without any new admission command.
+    let mut restoredA = pair.a.spaceStore.space().unwrap().members;
+    restoredA.sort();
+    let mut restoredB = pair.b.spaceStore.space().unwrap().members;
+    restoredB.sort();
+    let mut expected = vec![pair.a.localNodeId(), pair.b.localNodeId()];
+    expected.sort();
+    assert_eq!(restoredA, expected);
+    assert_eq!(restoredB, expected);
+    let applicantState = pair.a.networkControlStore.currentState().unwrap();
+    let targetState = pair.b.networkControlStore.currentState().unwrap();
+    assert_eq!(applicantState.memberNodeIds, targetState.memberNodeIds);
+    assert!(applicantState
+        .memberNodeIds
+        .contains(&pair.a.localNodeId()));
+    assert!(pair
+        .applicant
+        .outgoingDeviceSpaceJoins()
+        .unwrap()
+        .is_empty());
+    assert!(protocolRecords(&pair.b, INBOUND_RECORDS).is_empty());
+}
+
+/// Exercises the gateway refuses a submission whose source Space equals its own
+/// target Space instead of admitting an unreviewable request through isolated
+/// runtime stores.
+#[tokio::test]
+async fn gateway_rejects_a_submission_whose_source_equals_the_target_space() {
+    let _guard = routeTestGlobalLock().lock().await;
+    installTestRuntimeScheduler();
+    let pair = IndependentPair::new("self-merge");
+    let targetSpaceId = pair.b.spaceStore.space().unwrap().spaceId;
+    let applicant = pair.a.localNodeId();
+    let profile = serde_json::json!({
+        "nodeId": applicant, "displayName": "Applicant", "userName": "",
+        "platform": "test", "model": "test", "coreVersion": null, "updatedAt": 1,
+    });
+    let args = operit_link::toCoreValue(serde_json::json!({
+        "requestId": uuid::Uuid::new_v4().to_string(),
+        "sourceSpaceId": targetSpaceId,
+        "sourceRevision": 3,
+        "targetSpaceId": targetSpaceId,
+        "profile": profile,
+        "source": {
+            "space": {"spaceId": targetSpaceId, "spaceName": "Shared", "spaceRevision": 3,
+                      "members": [applicant]},
+            "deviceProfiles": [profile],
+            "controlOperations": [],
+            "topology": [],
+        },
+    }))
+    .unwrap();
+    let response = directCommand(&pair.a, &pair.b.localNodeId(), "requestJoin", args).await;
+    let error = response.result.unwrap_err();
+    assert!(
+        error.message.contains("distinct source Space"),
+        "unexpected error: {}",
+        error.message
+    );
+    // The rejected submission leaves no durable inbound record behind.
+    assert!(protocolRecords(&pair.b, INBOUND_RECORDS).is_empty());
+}
+
+/// Leaving is local, so a target that keeps hosting its Space still holds the
+/// earlier admission. A re-application from the forked source Space must
+/// retire that stale record and go through a fresh review instead of being
+/// blocked forever.
+#[tokio::test]
+async fn rejoin_after_only_the_applicant_leaves_starts_a_fresh_review() {
+    let _guard = routeTestGlobalLock().lock().await;
+    installTestRuntimeScheduler();
+    let (macRouter, mac) = approvalService("rejoin-mac");
+    let (iosRouter, ios) = approvalService("rejoin-ios");
+    let _link = installTestPeer(
+        &macRouter,
+        iosRouter.localNodeId(),
+        TestCoreNodeRouterEndpoint::new(iosRouter.clone()),
+    )
+    .unwrap();
+    let first = mac
+        .requestDeviceSpaceJoin("rejoin-ios".into())
+        .await
+        .unwrap();
+    ios.incomingDeviceSpaceJoins().await.unwrap();
+    ios.decideDeviceSpaceJoin(first.requestId.clone(), first.assignmentVersion, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        mac.refreshDeviceSpaceJoin(first.requestId.clone())
+            .await
+            .unwrap()
+            .status,
+        SpaceJoinStatus::Joined
+    );
+    // Only the applicant leaves; the target keeps hosting the same Space.
+    let targetSpace = ios.deviceSpace().unwrap();
+    mac.leaveDeviceSpace().unwrap();
+    assert_eq!(ios.deviceSpace().unwrap(), targetSpace);
+    // The stale admission is retired, so the new application is accepted...
+    let second = mac
+        .requestDeviceSpaceJoin("rejoin-ios".into())
+        .await
+        .unwrap();
+    assert_eq!(second.status, SpaceJoinStatus::Pending);
+    assert_ne!(second.requestId, first.requestId);
+    assert_eq!(second.reviewerDeviceId.as_deref(), Some("rejoin-ios"));
+    // ...but the retired admission can no longer be decided.
+    assert!(ios
+        .decideDeviceSpaceJoin(
+            first.requestId.clone(),
+            first.assignmentVersion,
+            true
+        )
+        .await
+        .is_err());
+    // Membership still needs an explicit approval of the fresh application.
+    let incoming = ios.incomingDeviceSpaceJoins().await.unwrap();
+    assert_eq!(incoming.len(), 1);
+    assert_eq!(incoming[0].requestId, second.requestId);
+    assert!(incoming[0].canApprove);
+    ios.decideDeviceSpaceJoin(second.requestId.clone(), second.assignmentVersion, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        mac.refreshDeviceSpaceJoin(second.requestId)
+            .await
+            .unwrap()
+            .status,
+        SpaceJoinStatus::Joined
+    );
+    assert_eq!(mac.deviceSpace().unwrap().spaceId, targetSpace.spaceId);
+}

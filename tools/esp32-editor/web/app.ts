@@ -1,3 +1,5 @@
+import type {DeviceState} from './device-state.js';
+import {ScenePreview} from './scene-renderer.js';
 import {request} from './transport.js';
 import {performDeviceAction} from './device-actions.js';
 import {point, pixel} from './model.js';
@@ -42,15 +44,7 @@ let lastFrame = 0;
 let pressed = false;
 let sourceHash = '';
 let miniStaticBytes = 0;
-interface DeviceState {
-  running?: boolean; connected?: boolean; paired?: boolean; pairingCode?: string; spaceState?: string;
-  spaceJoinPrompt?: string; spaceJoinBusy?: boolean;
-  spaceJoinRequestId?: string; spaceJoinAssignmentVersion?: number;
-  chatPreview?: string; chatScreen?: string; chatTask?: string;
-  chat?: {chatId?: string; messages?: {sender: string; text: string}[];
-    conversations?: {id: string; title: string; characterCardName?: string}[]; error?: string};
-  chatSendResult?: {ok: boolean; error?: string} | null;
-}
+const scenePreview = new ScenePreview();
 let deviceRunning = false;
 let latestDeviceState: DeviceState | null = null;
 const composer = document.createElement('form');
@@ -64,7 +58,7 @@ hostImage.addEventListener('change', async () => {
   const file = hostImage.files?.[0];
   if (!file) return;
   if (file.size === 0 || file.size > 512 * 1024 || !['image/png', 'image/jpeg'].includes(file.type)) {
-    hostStatus.textContent = '只支持小于 512 KiB 的 PNG/JPEG 图片'; hostImage.value = ''; return;
+    hostStatus.textContent = '只支持非空、大小不超过 512 KiB 的 PNG/JPEG 图片'; hostImage.value = ''; return;
   }
   hostStatus.textContent = '正在传输图片…'; hostImage.disabled = true;
   try {
@@ -160,6 +154,7 @@ function applyControls(): void {
 
 function setDeviceState(state: DeviceState): void {
   if (!runtime) return;
+  scenePreview.update(runtime, state.scene);
   if (state.paired !== undefined) runtime._operit_ui_set_paired(state.paired);
   runtime.ccall('operit_ui_set_pairing_code', null, ['string'], [state.pairingCode ?? '']);
   runtime.ccall('operit_ui_set_space_state', null, ['string'], [state.spaceState ?? '等待连接 Operit']);
@@ -180,6 +175,24 @@ function setDeviceState(state: DeviceState): void {
       [index, item.id, item.title, item.characterCardName ?? '', item.id === chat.chatId ? 1 : 0]));
     runtime.ccall('operit_ui_finish_conversations', null, ['number'], [conversations.length]);
   }
+  const plugins = state.plugins;
+  runtime.ccall('operit_ui_set_plugin_category', null, ['number'], [plugins?.category === 'exclusive' ? 1 : 0]);
+  const items = (plugins?.items ?? []).slice(0, 6);
+  items.forEach((item, index) => {
+    const status = item.status === 'probing' ? 1 : item.status === 'success' ? 2 : item.status === 'failure' ? 3 : 0;
+    const toolStatus = item.toolStatus === 'probing' ? 1 : item.toolStatus === 'success' ? 2 : item.toolStatus === 'failure' ? 3 : 0;
+    runtime!.ccall('operit_ui_set_plugin', null, ['number', 'string', 'string', 'number', 'number'],
+      [index, item.id, item.name, status, item.latencyMs ?? 0]);
+    runtime!.ccall('operit_ui_set_plugin_test', null, ['number', 'number', 'number', 'string'],
+      [index, toolStatus, item.toolLatencyMs ?? 0, item.testError ?? '']);
+  });
+  const details = plugins?.details;
+  runtime.ccall('operit_ui_set_plugin_details', null, ['string', 'string', 'string', 'number', 'number', 'number', 'string'],
+    [details?.id ?? '', details?.description ?? '', (details?.tools ?? []).slice(0, 3).join('\n'), details?.toolOffset ?? 0,
+      details?.toolTotal ?? 0, details?.loading ? 1 : 0, details?.error ?? '']);
+  runtime.ccall('operit_ui_set_plugin_testing', null, ['number'], [plugins?.testing ? 1 : 0]);
+  runtime.ccall('operit_ui_finish_plugins', null, ['number', 'number', 'number', 'number', 'string'],
+    [items.length, plugins?.offset ?? 0, plugins?.total ?? 0, plugins?.loading ? 1 : 0, plugins?.error ?? '']);
   runtime.ccall('operit_ui_set_chat_screen', null, ['string'], [state.chatScreen ?? '连接 Operit 后开始聊天']);
   runtime.ccall('operit_ui_set_chat_task', null, ['string'], [state.chatTask ?? '离线']);
   if (state.chatSendResult) finishSend(state.chatSendResult.ok, state.chatSendResult.error);
@@ -198,6 +211,7 @@ function renderFrame(now: number): void {
   if (currentRuntime && now - lastFrame >= interval) {
     lastFrame = now;
     const started = performance.now();
+    scenePreview.tick();
     currentRuntime._operit_ui_pump(0);
     const nextGeneration = currentRuntime._simulator_generation();
     if (nextGeneration !== generation) {
@@ -218,7 +232,7 @@ function renderFrame(now: number): void {
     syncTheme();
     pageLabel.textContent = currentRuntime.ccall('operit_ui_current_page', 'string', [], []);
     const kib = (bytes: number): string => (bytes / 1024).toFixed(1);
-    let resources = `自绘静态 RAM ${kib(miniStaticBytes)} KiB · UI 堆 0`;
+    let resources = `C UI 静态 RAM ${kib(miniStaticBytes)} KiB · C UI 动态分配 0`;
     if (currentRuntime._simulator_stack_size && currentRuntime._simulator_stack_free)
       resources += ` · C 栈剩余 ${kib(currentRuntime._simulator_stack_free())} / ${kib(currentRuntime._simulator_stack_size())} KiB`;
     renderTimeLabel.textContent = `${(performance.now() - started).toFixed(1)} ms · ${resources}`;
@@ -319,13 +333,13 @@ async function updateBuildStatus(): Promise<void> {
     const status = await request<BuildStatus>('/api/build');
     const manifest = status.manifest;
     buildStatus.textContent = status.running
-      ? '正在构建 WebAssembly + ESP32…'
+      ? '正在构建，请查看开发者日志…'
       : status.error
         ? '构建失败：' + status.error
         : status.stale
           ? '底层运行时源码已变化，需要开发者构建'
           : manifest?.firmwareBuilt
-            ? `基础运行时 ${manifest.sourceHash?.slice(0, 12) ?? ''}`
+            ? `固件构建完成 ${manifest.sourceHash?.slice(0, 12) ?? ''} · 烧录需另行执行`
             : '预览已构建；固件未验证';
     if (
       sourceHash &&

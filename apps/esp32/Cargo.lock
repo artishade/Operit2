@@ -1539,6 +1539,22 @@ version = "0.1.0"
 dependencies = [
  "operit-link",
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "operit-edge-scene"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "operit-edge-contract",
+ "operit-link",
+ "operit-node-edge",
+ "ring",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1553,6 +1569,7 @@ dependencies = [
  "log",
  "operit-board-esp32",
  "operit-edge-contract",
+ "operit-edge-scene",
  "operit-host-api",
  "operit-host-native-scheduler",
  "operit-link",
@@ -1564,6 +1581,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1584,6 +1602,7 @@ name = "operit-host-native-scheduler"
 version = "0.1.0"
 dependencies = [
  "operit-host-api",
+ "serde_json",
  "tokio",
 ]
 
@@ -1609,7 +1628,9 @@ dependencies = [
  "operit-link",
  "operit-node-runtime",
  "serde",
+ "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

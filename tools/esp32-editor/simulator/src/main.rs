@@ -110,8 +110,10 @@ async fn run(nodeServices: Option<NodeServices>) -> Result<(), Box<dyn std::erro
     let deviceInfo = LinkDeviceInfo {
         platform: "esp32".into(),
         model: "ESP32-2432S028-SIM".into(),
-    };
+    pairingIncarnation: None,
+};
     let edgeRouter = EdgePeerRouter::new(nodeId.clone());
+    let scenePlugin = Arc::new(operit_edge_scene::ScenePlugin::new(320, 240, 24, true));
     let mut edgeNode = operit_node_edge::EdgeNode::fromHostManager(hostManager.clone())
         .withPlugin(Arc::new(SimulatorStatusPlugin {
             address: configuredAddress.clone(),
@@ -155,11 +157,18 @@ async fn run(nodeServices: Option<NodeServices>) -> Result<(), Box<dyn std::erro
         model: deviceInfo.model.clone(),
         coreVersion: None,
         updatedAt: operit_host_api::TimeUtils::currentTimeMillis(),
-    })?;
+    pairingIncarnation: None,
+})?;
     edgeRouter.installSpace(spaceService.clone())?;
+    edgeNode = edgeNode
+        .withPlugin(scenePlugin.clone())
+        .map_err(|error| error.message)?;
     edgeNode = edgeNode.withNodeServices(services.clone());
     let edgeNode = Arc::new(edgeNode);
     edgeRouter.install(edgeNode.clone())?;
+    let _sceneEvents = edge_chat::startEdgeEvents(
+        services.clone(), scenePlugin.clone(), nodeId.clone(),
+    );
     if startListener {
         services.peers().startListening(&[PeerTransport::Tcp]).await?;
     }
@@ -172,28 +181,14 @@ async fn run(nodeServices: Option<NodeServices>) -> Result<(), Box<dyn std::erro
     );
     // Match the firmware's 500 ms Space route polling. Compiling edge_chat
     // alone does not install a session; pairing and approval must not fake one.
-    let peers = services.peers();
     let mut routePoll = tokio::time::interval(std::time::Duration::from_millis(500));
     routePoll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut chatRouteInstalled = false;
-    let mut reconnectChatId = String::new();
+    let mut chatRoute = edge_chat::SpaceChatRoute::default();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     loop {
         let line = tokio::select! {
             _ = routePoll.tick() => {
-                if let Some(client) = peers.spaceClient() {
-                    if !chatRouteInstalled || edge_chat::needsReconnect() {
-                        if chatRouteInstalled {
-                            reconnectChatId = edge_chat::snapshot()["chatId"].as_str().unwrap_or("").to_owned();
-                        }
-                        edge_chat::install(client, services.clone(), reconnectChatId.clone());
-                        chatRouteInstalled = true;
-                    }
-                } else if chatRouteInstalled {
-                    reconnectChatId = edge_chat::snapshot()["chatId"].as_str().unwrap_or("").to_owned();
-                    edge_chat::clear();
-                    chatRouteInstalled = false;
-                }
+                chatRoute.poll(services.clone());
                 continue;
             }
             line = lines.next_line() => match line? {
@@ -227,6 +222,7 @@ async fn run(nodeServices: Option<NodeServices>) -> Result<(), Box<dyn std::erro
                     .ok()
                     .and_then(|requests| requests.into_iter().find(|request| request.canApprove));
                 Ok(serde_json::json!({"address": address,
+                "scene": scenePlugin.summary(),
                 "memory": memory::snapshot(),
                 "deviceId": "esp32-edge-simulator", "paired": paired,
                 "peerServiceAvailable": services.is_ok(),
@@ -236,13 +232,14 @@ async fn run(nodeServices: Option<NodeServices>) -> Result<(), Box<dyn std::erro
                 "spaceJoinAssignmentVersion": space_join.as_ref().map(|request| request.assignmentVersion).unwrap_or(0),
                 "error": *error.lock().unwrap(),
                 "lastAction": *lastAction.lock().unwrap(),
-                "chat": chat_state, "chatPreview": edge_chat::preview(), "chatScreen": chat_screen,
+                "plugins": edge_chat::pluginsSnapshot(), "chat": chat_state, "chatPreview": edge_chat::preview(), "chatScreen": chat_screen,
                 "chatTask": edge_chat::taskStatus(),
                 "chatSendResult": edge_chat::takeSendResult().map(|result| match result {
                     Ok(()) => serde_json::json!({"ok": true}),
                     Err(error) => serde_json::json!({"ok": false, "error": error}),
                 })}))
             }
+            Some("sceneView") => Ok(scenePlugin.visual_snapshot()),
             Some("memory") => Ok(memory::snapshot()),
             // Decision/cleanup failures belong to this RPC, not to run(). In
             // particular a stale approval tap after cancellation must not
@@ -250,7 +247,20 @@ async fn run(nodeServices: Option<NodeServices>) -> Result<(), Box<dyn std::erro
             Some("action") => async {
                 let action = request["action"].as_str().unwrap_or("");
                 *lastAction.lock().unwrap() = action.to_string();
-                if action == "edge_space_approve" || action == "edge_space_reject" {
+                if action == "edge_scene_exit" {
+                    scenePlugin.system_exit();
+                } else if let Some(point) = action.strip_prefix("edge_scene_touch:") {
+                    let (x, y) = point.split_once(':').ok_or("Invalid scene point")?;
+                    if pairing_code.is_empty()
+                        && spaceService.incomingDeviceSpaceJoins().await
+                            .map_err(|error| error.to_string())?.is_empty()
+                    {
+                        scenePlugin.touch(
+                            x.parse().map_err(|_| "Invalid scene x")?,
+                            y.parse().map_err(|_| "Invalid scene y")?,
+                        );
+                    }
+                } else if action == "edge_space_approve" || action == "edge_space_reject" {
                     // Match firmware's captured pending request/version. A stale
                     // screen must never approve a different, newer submission.
                     let requestId = request["requestId"].as_str()
@@ -264,6 +274,8 @@ async fn run(nodeServices: Option<NodeServices>) -> Result<(), Box<dyn std::erro
                         assignmentVersion,
                         approve,
                     ).await.map_err(|error| error.to_string())?;
+                } else if action.starts_with("edge_plugins_") || action.starts_with("edge_plugin_") {
+                    edge_chat::pluginsAction(action)?;
                 } else if action == "edge_pair" || action == "edge_unpair" {
                     let result = async {
                         if action == "edge_pair" {
@@ -285,7 +297,7 @@ async fn run(nodeServices: Option<NodeServices>) -> Result<(), Box<dyn std::erro
                                         .map_err(|e| e.to_string())?;
                                 }
                             }
-                            edge_chat::clear();
+                            chatRoute.reset();
                         }
                         Ok::<_, String>(())
                     }
@@ -293,7 +305,7 @@ async fn run(nodeServices: Option<NodeServices>) -> Result<(), Box<dyn std::erro
                     result?;
                 } else if action == "edge_space_leave" {
                     spaceService.leaveDeviceSpace()?;
-                    edge_chat::clear();
+                    chatRoute.reset();
                 } else if action == "edge_history_older" || action == "edge_history_newer" {
                     edge_chat::moveHistory(action == "edge_history_older")?;
                 } else if action == "edge_new" {

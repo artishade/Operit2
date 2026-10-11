@@ -158,6 +158,8 @@ fn runFirmware(
     // optional diagnostic framebuffer so pairing and chat retain heap headroom.
     board.screenMirror().disablePixelMirror();
     let mut ui = Esp32Ui::new(&board)?;
+    let scenePlugin = Arc::new(operit_edge_scene::ScenePlugin::new(320, 240, 24, true));
+    ui.attachScene(Arc::clone(&scenePlugin));
     let scheduler =
         Arc::new(operit_host_native_scheduler::LocalHostRuntimeTaskSchedulerHost::new()?);
     operit_host_api::HostManager::setDefaultHostRuntimeTaskSchedulerHost(scheduler.clone());
@@ -170,7 +172,8 @@ fn runFirmware(
             LinkDeviceInfo {
                 platform: "esp32".into(),
                 model: "ESP32-2432S028".into(),
-            },
+            pairingIncarnation: None,
+        },
             false,
         )
         .map_err(HostError::new)?;
@@ -303,8 +306,9 @@ fn runFirmware(
             platform: deviceInfo.platform.clone(),
             model: deviceInfo.model.clone(),
             coreVersion: None,
+            pairingIncarnation: deviceInfo.pairingIncarnation.clone(),
             updatedAt: currentTimeMillis(),
-        },
+    },
         scheduler.clone(),
     )?;
     let mut edgeNode = operit_node_edge::EdgeNode::fromHostManager(hostManager.clone())
@@ -312,12 +316,20 @@ fn runFirmware(
             &status,
         ))))
         .map_err(|error| HostError::new(error.message))?;
+    edgeNode = edgeNode
+        .withPlugin(scenePlugin.clone())
+        .map_err(|error| HostError::new(error.message))?;
     edgeNode = edgeNode.withPlugin(Arc::new(edge_plugin::DeviceUiPlugin)).map_err(|error| HostError::new(error.message))?;
     edgeNode = edgeNode.withNodeServices(NodeServices::new(peerService.clone()));
     let edgeNode = Arc::new(edgeNode);
     edgeRouter
         .install(edgeNode.clone())
         .map_err(HostError::new)?;
+    let _sceneEvents = crate::edge_chat::startEdgeEvents(
+        NodeServices::new(peerService.clone()),
+        scenePlugin.clone(),
+        identity.nodeId.clone(),
+    );
     let mut peerChanges = peerService.subscribePeerChanges();
     let mut pairingCodeSelection = crate::status::PairingCodeSelection::default();
     let mut pairingState = || -> Result<(bool, String), String> {
@@ -381,8 +393,7 @@ fn runFirmware(
     logRuntimeHealth("ready");
     let mut lastChatRevision = u32::MAX;
     let mut lastChatConnected = false;
-    let mut chatRouteInstalled = false;
-    let mut reconnectChatId = String::new();
+    let mut chatRoute = crate::edge_chat::SpaceChatRoute::default();
     let mut nextChatRoutePoll = std::time::Instant::now();
     loop {
         if std::time::Instant::now() >= nextWifiPoll {
@@ -403,6 +414,18 @@ fn runFirmware(
         crate::edge_plugin::pumpUi(&mut ui);
         for action in ui.drainActions() {
             if spaceJoinUi.action(&action, &mut ui) {
+                continue;
+            }
+            if action == "edge_scene_exit" {
+                scenePlugin.system_exit();
+                continue;
+            }
+            if let Some(point) = action.strip_prefix("edge_scene_touch:") {
+                if let Some((x, y)) = point.split_once(':').and_then(|(x, y)| {
+                    Some((x.parse::<u16>().ok()?, y.parse::<u16>().ok()?))
+                }) {
+                    scenePlugin.touch(x, y);
+                }
                 continue;
             }
             match action.as_str() {
@@ -478,12 +501,15 @@ fn runFirmware(
                     })();
                     match result {
                         Ok(()) => {
-                            crate::edge_chat::clear();
+                            chatRoute.reset();
                             status.setPairingCode("");
                             setExpression("neutral")?;
                         }
                         Err(error) => ui.actionError(&error),
                     }
+                }
+                action if action.starts_with("edge_plugins_") || action.starts_with("edge_plugin_") => {
+                    if let Err(error) = crate::edge_chat::pluginsAction(action) { ui.actionError(&error); }
                 }
                 "edge_chat" => {}
                 "edge_history_older" | "edge_history_newer" => {
@@ -522,19 +548,7 @@ fn runFirmware(
         // display in the same loop iteration.
         if std::time::Instant::now() >= nextChatRoutePoll {
             nextChatRoutePoll = std::time::Instant::now() + std::time::Duration::from_millis(500);
-            if let Some(client) = peerService.spaceClient() {
-                if !chatRouteInstalled || crate::edge_chat::needsReconnect() {
-                    if chatRouteInstalled {
-                        reconnectChatId = crate::edge_chat::snapshot()["chatId"].as_str().unwrap_or("").to_owned();
-                    }
-                    crate::edge_chat::install(client, NodeServices::new(peerService.clone()), reconnectChatId.clone());
-                    chatRouteInstalled = true;
-                }
-            } else if chatRouteInstalled {
-                reconnectChatId = crate::edge_chat::snapshot()["chatId"].as_str().unwrap_or("").to_owned();
-                crate::edge_chat::clear();
-                chatRouteInstalled = false;
-            }
+            chatRoute.poll(NodeServices::new(peerService.clone()));
         }
         let edgeReady = crate::edge_chat::isConnected();
         let mut pairingChanged = false;
@@ -580,6 +594,7 @@ fn runFirmware(
         if chatRevision != lastChatRevision || chatConnected != lastChatConnected {
             let chatState = crate::edge_chat::snapshot();
             ui.setChatState(&chatState);
+            ui.setPlugins(&crate::edge_chat::pluginsSnapshot());
             ui.setChatScreen(&crate::edge_chat::screenTextFromSnapshot(&chatState));
             ui.setChatTask(&crate::edge_chat::taskStatus());
             lastChatRevision = chatRevision;

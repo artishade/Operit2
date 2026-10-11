@@ -2548,6 +2548,9 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsRuntimePairToken => '连接 Token';
 
   @override
+  String get settingsRuntimePairTokenHint => '跨网配对时必填；同网段设备可留空';
+
+  @override
   String get settingsRuntimePairCode => '配对码';
 
   @override
@@ -3661,13 +3664,13 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsRuntimeNetworkControlDescription => '角色、身份、设备权限与审计';
 
   @override
+  String get settingsRuntimeIdentitiesAndPermissions => '身份与权限';
+
+  @override
   String get settingsRuntimeControlInitialize => '初始化控制';
 
   @override
   String get settingsRuntimeControlRoles => '角色';
-
-  @override
-  String get settingsRuntimeControlIdentities => '身份';
 
   @override
   String get settingsRuntimeControlAudit => '审计';
@@ -3697,13 +3700,15 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsRuntimeControlIdentityName => '身份名称';
 
   @override
-  String get settingsRuntimeControlDevice => '设备';
-
-  @override
   String get settingsRuntimeControlDeviceId => '设备 ID';
 
   @override
   String get settingsRuntimeControlNoAudit => '暂无控制命令记录';
+
+  @override
+  String settingsRuntimeControlAuditCount(int count) {
+    return '共 $count 条记录';
+  }
 
   @override
   String get settingsRuntimeControlNoBindings => '暂无设备绑定';
@@ -3718,16 +3723,16 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsRuntimeControlRemoveDevice => '移除设备';
 
   @override
-  String get settingsRuntimeControlDisconnectDevice => '断开设备';
+  String get settingsRuntimeControlDisconnectDevice => '隔离设备';
 
   @override
   String get settingsRuntimeControlRemoved => '已移除';
 
   @override
-  String get settingsRuntimeControlDisconnected => '已断开';
+  String get settingsRuntimeControlDisconnected => '已隔离';
 
   @override
-  String get settingsRuntimeControlAdmitDevice => '重新接纳设备';
+  String get settingsRuntimeControlAdmitDevice => '解除隔离设备';
 
   @override
   String get settingsRuntimeControlAllDevices => '全部设备';
@@ -3751,13 +3756,18 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsRuntimeControlClearIdentity => '重置为默认身份';
 
   @override
-  String get settingsRuntimeControlDeviceAdmitted => '已解除连接限制，等待设备重连';
+  String get settingsRuntimeControlDeviceAdmitted => '已解除隔离，等待设备重连';
 
   @override
   String get settingsRuntimeControlIdentityResetDone => '身份已重置为默认用户';
 
   @override
   String get settingsRuntimeControlIdentityDefinitions => '身份定义';
+
+  @override
+  String settingsRuntimeControlIdentityCount(int count) {
+    return '共 $count 个身份';
+  }
 
   @override
   String get settingsRuntimeControlIdentityAssignment => '身份分配';
@@ -4174,6 +4184,47 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get deviceSpaceDevices => '设备';
+
+  @override
+  String get deviceSpaceMemberNotPaired => '空间成员 · 未直连';
+
+  @override
+  String get deviceSpaceMemberPaired => '空间成员 · 已直连';
+
+  @override
+  String get deviceSpacePairedOnly => '已配对';
+
+  @override
+  String get deviceSpaceDirectLink => '直连';
+
+  @override
+  String deviceSpaceRelayHops(int hops) {
+    return '经中继 $hops 跳';
+  }
+
+  @override
+  String get deviceSpaceRelayPath => '路径';
+
+  @override
+  String get deviceSpaceLocalDevice => '本机';
+
+  @override
+  String get deviceSpaceManageDevice => '管理设备';
+
+  @override
+  String get deviceSpaceConnectDirect => '建立直连';
+
+  @override
+  String get deviceSpaceConnectDirectHint =>
+      '该设备已是本空间成员。与它配对成功即建立直连，无需重新加入空间；配对需要对方显示、由你输入六位确认码。';
+
+  @override
+  String deviceSpaceDirectLinkEstablished(String device) {
+    return '已建立直连：$device';
+  }
+
+  @override
+  String get deviceSpaceUnpair => '解除配对';
 
   @override
   String get deviceSpaceMore => '更多设备操作';

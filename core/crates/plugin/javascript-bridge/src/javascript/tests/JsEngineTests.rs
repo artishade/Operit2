@@ -13,8 +13,8 @@ use operit_plugin_sdk::execution_result::JsExecutionErrorKind;
 use operit_plugin_sdk::javascript::{
     JsExecutionHost, JsToolCallRequest, JsToolCallResult, JsToolCallResultData,
     JsToolNameResolutionRequest, JsToolPkgIpcCompletion, JsToolPkgIpcRequest,
-    JsToolPkgResourceRequest, JsToolPkgWasmRequest, JsToolPkgWasmResult, ToolPkgConfigScope, ToolPkgExecutionContext,
-    ToolPkgTextResourceHost,
+    JsToolPkgResourceRequest, JsToolPkgWasmRequest, JsToolPkgWasmResult, ToolPkgConfigScope,
+    ToolPkgExecutionContext, ToolPkgTextResourceHost,
 };
 use operit_plugin_sdk::JsPackageLoader::JsPackageLoader;
 use operit_store::RuntimeStorageHost::setDefaultRuntimeStorageHost;
@@ -100,6 +100,7 @@ pub(super) fn newTestJsEngineState(
 #[derive(Default)]
 struct TestPluginConfigExecutionHost {
     gatedToolCalls: Arc<Mutex<Vec<tokio::sync::oneshot::Sender<JsToolCallResult>>>>,
+    edgePortCalls: Arc<Mutex<Vec<Value>>>,
     gatedToolStarted: Arc<tokio::sync::Notify>,
     toolPkgTextResourceReads: AtomicUsize,
     registrationConfigReads: AtomicUsize,
@@ -122,12 +123,9 @@ impl ToolPkgTextResourceHost for StaticToolPkgTextResourceHost {
         &self,
         _package_name_or_subpackage_id: &str,
         resource_path: &str,
-    ) -> Result<String, String> {
+    ) -> Result<Option<String>, String> {
         let normalizedPath = resource_path.trim().to_ascii_lowercase();
-        self.resources
-            .get(&normalizedPath)
-            .cloned()
-            .ok_or_else(|| format!("ToolPkg text resource not found: {normalizedPath}"))
+        Ok(self.resources.get(&normalizedPath).cloned())
     }
 }
 
@@ -146,7 +144,34 @@ impl JsExecutionHost for TestPluginConfigExecutionHost {
     ) -> operit_plugin_sdk::javascript::JsExecutionCompletion<JsToolCallResult> {
         let gatedToolCalls = self.gatedToolCalls.clone();
         let gatedToolStarted = self.gatedToolStarted.clone();
+        let edgePortCalls = self.edgePortCalls.clone();
         Box::pin(async move {
+            if matches!(request.tool_name.as_str(),"edge_execute"|"io_execute") {
+                edgePortCalls.lock().unwrap().push(serde_json::json!({"tool":request.tool_name,"params":request.parameters}));
+                let node = request.parameters["node_id"].as_str().unwrap_or("");
+                return if node == "unauthorized" {
+                    JsToolCallResult {success:false,data:JsToolCallResultData::Value(Value::Null),error:Some("Edge node access denied".into())}
+                } else {
+                    JsToolCallResult {success:true,data:JsToolCallResultData::Value(serde_json::json!({"nodeId":node,"data":{"ok":true}})),error:None}
+                };
+            }
+
+            if request.tool_name == "echo" {
+                return JsToolCallResult {
+                    success: true,
+                    data: JsToolCallResultData::Value(
+                        serde_json::to_value(request.parameters).unwrap(),
+                    ),
+                    error: None,
+                };
+            }
+            if request.tool_name == "binary" {
+                return JsToolCallResult {
+                    success: true,
+                    data: JsToolCallResultData::Binary(vec![1, 2, 3]),
+                    error: None,
+                };
+            }
             if request.tool_name == "gate" {
                 let (sender, receiver) = tokio::sync::oneshot::channel();
                 gatedToolCalls.lock().unwrap().push(sender);
@@ -229,7 +254,10 @@ impl JsExecutionHost for TestPluginConfigExecutionHost {
 
     /// Resolves scoped configuration through the explicit test contract.
     fn scoped_plugin_config_dir(&self, _owner_id: &str, plugin_id: &str) -> Result<String, String> {
-        let _manager = self.packageManagerLock.lock().expect("test package manager lock");
+        let _manager = self
+            .packageManagerLock
+            .lock()
+            .expect("test package manager lock");
         self.plugin_config_dir(plugin_id)
     }
 
@@ -241,14 +269,21 @@ impl JsExecutionHost for TestPluginConfigExecutionHost {
         scope: ToolPkgConfigScope,
     ) -> Result<String, String> {
         self.registrationConfigReads.fetch_add(1, Ordering::Relaxed);
-        let root = operit_store::ExtensionStore::ExtensionStore::configPathForScope(owner_id, scope.as_str())?;
+        let root = operit_store::ExtensionStore::ExtensionStore::configPathForScope(
+            owner_id,
+            scope.as_str(),
+        )?;
         let path = if plugin_id == owner_id {
             root
         } else {
             let name = operit_util::OperitPaths::pluginConfigDirName(plugin_id)?;
             format!("{root}/namespaces/{name}")
         };
-        Ok(format!("/app/data/{}", path.strip_prefix("runtime/").ok_or("invalid test config path")?))
+        Ok(format!(
+            "/app/data/{}",
+            path.strip_prefix("runtime/")
+                .ok_or("invalid test config path")?
+        ))
     }
 
     /// Records direct ToolPkg text resource reads rejected by this test host.
@@ -256,7 +291,7 @@ impl JsExecutionHost for TestPluginConfigExecutionHost {
         &self,
         _package_name_or_subpackage_id: &str,
         _resource_path: &str,
-    ) -> Result<String, String> {
+    ) -> Result<Option<String>, String> {
         self.toolPkgTextResourceReads
             .fetch_add(1, Ordering::Relaxed);
         Err("ToolPkg text resources are not part of this test host".to_string())
@@ -281,13 +316,16 @@ impl JsExecutionHost for TestPluginConfigExecutionHost {
     /// Rejects unexpected Compose DSL controller commands.
     fn handle_compose_webview_controller_command(
         &self,
-        _payload_json: &str,
-    ) -> Result<String, String> {
+        _payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         panic!("Compose DSL WebView control is not part of the plugin config test")
     }
 
     /// Rejects unexpected Compose DSL file-picker requests.
-    fn open_compose_file_picker(&self, _payload_json: &str) -> Result<String, String> {
+    fn open_compose_file_picker(
+        &self,
+        _payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         panic!("Compose DSL file picking is not part of the plugin config test")
     }
 
@@ -622,7 +660,7 @@ async fn javascript_timer_can_win_race_against_async_tool_call() {
     engine.destroy();
 }
 
-/// Verifies a detached-call preparation predicate is serialized before Rust reads it as text.
+/// Verifies detached-call lifecycle queries return structured booleans without JSON text.
 #[test]
 fn detached_call_preparation_accepts_boolean_result() {
     testJavaScriptRuntimeHost();
@@ -633,7 +671,7 @@ fn detached_call_preparation_accepts_boolean_result() {
         .expect("JavaScript test environment must initialize");
     state
         .evalJavaScriptVoid(
-            "var call = __operitRegisterCallSession('detached-call', {}); call.detached = true; call.pendingReferences = 1;",
+            "var call = __operitRegisterCallSession('detached-call', {}); call.detached = true; call.pendingReferences = 1; JSON.parse = JSON.stringify = function() { throw Error('JSON transport used'); };",
         )
         .expect("detached JavaScript call must initialize");
 
@@ -921,6 +959,7 @@ fn execute_promise_script_repeatedly_on_same_engine() {
             Value::String(format!("same-engine-{index}")),
         );
         let output = state.execute_script_function_on_current_thread(
+            super::JsTextResourceSource::ExecutionHost,
             script,
             "async_echo",
             &params,
@@ -949,6 +988,7 @@ fn execute_complete_finishes_call_before_return_value() {
     let params = testParams();
 
     let output = state.execute_script_function_on_current_thread(
+        super::JsTextResourceSource::ExecutionHost,
         script,
         "complete_first",
         &params,
@@ -981,6 +1021,7 @@ fn execute_function_with_active_module_context() {
     let params = testParams();
 
     let output = state.execute_script_function_on_current_thread(
+        super::JsTextResourceSource::ExecutionHost,
         script,
         "inspect_context",
         &params,
@@ -1025,6 +1066,7 @@ fn bootstrap_exposes_ui_android_okhttp_api() {
     let params = testParams();
 
     let output = state.execute_script_function_on_current_thread(
+        super::JsTextResourceSource::ExecutionHost,
         script,
         "inspect_bootstrap_api",
         &params,
@@ -1059,6 +1101,7 @@ fn toolpkg_ipc_local_call_returns_handler_result() {
     let params = testParams();
 
     let output = state.execute_script_function_on_current_thread(
+        super::JsTextResourceSource::ExecutionHost,
         script,
         "local_ipc",
         &params,
@@ -1092,6 +1135,7 @@ fn runtime_context_with_context_runs_local_main_runner() {
     let params = testParams();
 
     let output = state.execute_script_function_on_current_thread(
+        super::JsTextResourceSource::ExecutionHost,
         script,
         "context_runner",
         &params,
@@ -1311,15 +1355,19 @@ async fn pending_call_releases_state_and_preserves_call_context() {
     let first = tokio::spawn(waiting.execute_script_function(
         r#"exports.first = async function() {
             globalThis.firstFinished = false;
-            NativeInterface.sendCallIntermediateResult(globalThis.__operitCurrentCallId, 'waiting');
+            __operitSendIntermediateResult(globalThis.__operitCurrentCallId, 'waiting');
             await Tools.System.sleep(200);
-            NativeInterface.sendCallIntermediateResult(globalThis.__operitCurrentCallId, getEnv('CALL_OWNER'));
+            __operitSendIntermediateResult(globalThis.__operitCurrentCallId, getEnv('CALL_OWNER'));
             globalThis.firstFinished = true;
             return getEnv('CALL_OWNER');
         };"#,
-        "first", &testParams(),
+        "first",
+        &testParams(),
         &BTreeMap::from([("CALL_OWNER".to_string(), "first".to_string())]),
-        Some(callback), true, 2, None,
+        Some(callback),
+        true,
+        2,
+        None,
     ));
     assert_eq!(received.recv().await.unwrap(), "waiting");
     let output = engine.execute_script_function(
@@ -1348,8 +1396,8 @@ async fn call_environment_updates_survive_state_turns() {
     let output = engine
         .execute_script_function(
             r#"exports.update = async function() {
-            NativeInterface.setEnv('CALL_OWNER', 'updated');
-            NativeInterface.setEnvs(JSON.stringify({ SECOND: 'second' }));
+            __operitNativeSetEnv(String(globalThis.__operitCurrentCallId), 'CALL_OWNER', 'updated');
+            __operitNativeSetEnvs(String(globalThis.__operitCurrentCallId), { SECOND: 'second' });
             await Tools.System.sleep(5);
             return { owner: getEnv('CALL_OWNER'), second: getEnv('SECOND') };
         };"#,
@@ -1387,19 +1435,31 @@ fn abandoned_async_request_cancels_affine_session() {
     let local = tokio::task::LocalSet::new();
     local.block_on(&runtime, async move {
         let task = tokio::task::spawn_local(async move {
-            caller.execute_script_function_async(
-                r#"exports.wait = async function() {
-                    NativeInterface.sendCallIntermediateResult(globalThis.__operitCurrentCallId, 'started');
+            caller
+                .execute_script_function_async(
+                    r#"exports.wait = async function() {
+                    __operitSendIntermediateResult(globalThis.__operitCurrentCallId, 'started');
                     return await new Promise(function() {});
-                };"#.to_string(),
-                "wait".to_string(), testParams(), BTreeMap::new(), Some(callback), true, 2_000, None,
-            ).await
+                };"#
+                    .to_string(),
+                    "wait".to_string(),
+                    testParams(),
+                    BTreeMap::new(),
+                    Some(callback),
+                    true,
+                    2_000,
+                    None,
+                )
+                .await
         });
         let deadline = Instant::now() + Duration::from_secs(1);
         while !started.load(Ordering::Acquire) && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        assert!(started.load(Ordering::Acquire), "aborted request must have started");
+        assert!(
+            started.load(Ordering::Acquire),
+            "aborted request must have started"
+        );
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
     });
@@ -1501,6 +1561,7 @@ fn execute_inline_hook_function_source() {
     );
 
     let output = state.execute_script_function_on_current_thread(
+        super::JsTextResourceSource::ExecutionHost,
         script,
         "__operit_inline_test",
         &params,
@@ -1872,6 +1933,7 @@ fn execute_function_from_module_exports() {
     params.insert("text".to_string(), Value::String("exports".to_string()));
 
     let output = state.execute_script_function_on_current_thread(
+        super::JsTextResourceSource::ExecutionHost,
         script,
         "module_only",
         &params,
@@ -1917,6 +1979,7 @@ fn execute_minified_package_script_with_metadata() {
     params.insert("text".to_string(), Value::String("metadata".to_string()));
 
     let output = state.execute_script_function_on_current_thread(
+        super::JsTextResourceSource::ExecutionHost,
         &package.tools[0].script,
         &package.tools[0].name,
         &params,
@@ -2034,18 +2097,17 @@ fn execute_message_insert_shared_module_loads() {
         Value::String("dist/main.js".to_string()),
     );
     let mut state = newTestJsEngineState(None);
-    let output = super::executeWithToolPkgTextResources(Arc::new(textResources), || {
-        state.execute_script_function_on_current_thread(
-            &script,
-            "load_shared",
-            &params,
-            &BTreeMap::new(),
-            None,
-            true,
-            60,
-            None,
-        )
-    });
+    let output = state.execute_script_function_on_current_thread(
+        super::JsTextResourceSource::Snapshot(Arc::new(textResources)),
+        &script,
+        "load_shared",
+        &params,
+        &BTreeMap::new(),
+        None,
+        true,
+        60,
+        None,
+    );
     let output = output.expect("message_insert shared module should execute");
     assert!(output.is_some());
 }
@@ -2080,18 +2142,17 @@ fn execute_message_insert_input_menu_hook_from_main_entry() {
         serde_json::json!({ "action": "create" }),
     );
     let mut state = newTestJsEngineState(Some(Arc::new(TestPluginConfigExecutionHost::default())));
-    let output = super::executeWithToolPkgTextResources(Arc::new(textResources), || {
-        state.execute_script_function_on_current_thread(
-            &script,
-            "onInputMenuToggle",
-            &params,
-            &BTreeMap::new(),
-            None,
-            true,
-            60,
-            None,
-        )
-    });
+    let output = state.execute_script_function_on_current_thread(
+        super::JsTextResourceSource::Snapshot(Arc::new(textResources)),
+        &script,
+        "onInputMenuToggle",
+        &params,
+        &BTreeMap::new(),
+        None,
+        true,
+        60,
+        None,
+    );
     let raw = expect_js_output(output, "message_insert input menu hook");
     let definitions =
         serde_json::from_str::<Value>(&raw).expect("message_insert input menu definitions JSON");
@@ -2578,6 +2639,7 @@ fn execute_script_can_require_axios_and_uuid() {
     let params = testParams();
 
     let output = state.execute_script_function_on_current_thread(
+        super::JsTextResourceSource::ExecutionHost,
         script,
         "inspect_require",
         &params,
@@ -2778,7 +2840,7 @@ fn scoped_config_directory_throws_host_failure() {
     let script = r#"
         exports.read_config = function() {
             try {
-                NativeInterface.getScopedPluginConfigDir('missing', 'missing');
+                __operitNativeGetScopedPluginConfigDir('missing', 'missing');
                 return 'unexpected success';
             } catch (error) {
                 return error.message;
@@ -2786,7 +2848,15 @@ fn scoped_config_directory_throws_host_failure() {
         };
     "#;
     let output = state.execute_script_function_on_current_thread(
-        script, "read_config", &testParams(), &BTreeMap::new(), None, true, 60, None,
+        super::JsTextResourceSource::ExecutionHost,
+        script,
+        "read_config",
+        &testParams(),
+        &BTreeMap::new(),
+        None,
+        true,
+        60,
+        None,
     );
     let output = expect_js_output(output, "scoped configuration failure");
     assert_eq!(
@@ -2810,6 +2880,7 @@ fn native_interface_reads_env_override_for_call() {
     let envOverrides = BTreeMap::from([(key.to_string(), "enabled".to_string())]);
 
     let output = state.execute_script_function_on_current_thread(
+        super::JsTextResourceSource::ExecutionHost,
         script,
         "read_env",
         &params,
@@ -2837,9 +2908,13 @@ fn native_interface_resolves_plugin_config_dir() {
         };
     "#;
     let mut params = testParams();
-    params.insert("toolPkgId".to_string(), Value::String("test.package".to_string()));
+    params.insert(
+        "toolPkgId".to_string(),
+        Value::String("test.package".to_string()),
+    );
 
     let output = state.execute_script_function_on_current_thread(
+        super::JsTextResourceSource::ExecutionHost,
         script,
         "config_dir",
         &params,
@@ -2852,7 +2927,10 @@ fn native_interface_resolves_plugin_config_dir() {
     let output = expect_js_output(output, "config dir execution");
     let path = serde_json::from_str::<String>(&output).expect("serialized config dir");
 
-    assert_eq!(path, "/app/data/extensions/device/plugins/configs/plugin_name");
+    assert_eq!(
+        path,
+        "/app/data/extensions/device/plugins/configs/plugin_name"
+    );
 }
 
 #[test]
@@ -2877,6 +2955,7 @@ fn probe_async_function_declaration_inside_iife() {
     let params = testParams();
 
     let output = state.execute_script_function_on_current_thread(
+        super::JsTextResourceSource::ExecutionHost,
         script,
         "get_device_info",
         &params,
@@ -2891,8 +2970,6 @@ fn probe_async_function_declaration_inside_iife() {
         .expect("async function declaration probe execution")
         .is_some());
 }
-
-
 
 /// Reads session ownership on the affine executor without driving JavaScript work.
 async fn executionSessionCounts(engine: &super::JsEngine) -> (usize, usize) {
@@ -2952,7 +3029,7 @@ async fn completion_retains_detached_promise_context_until_host_event() {
             globalThis.detachedRuns = 0;
             toolCall('gate', {}).then(function() {
                 globalThis.detachedRuns++;
-                NativeInterface.setEnv('DETACHED_HOST_OWNER', 'original');
+                __operitNativeSetEnv(String(globalThis.__operitCurrentCallId), 'DETACHED_HOST_OWNER', 'original');
                 sendIntermediateResult({
                     owner: getEnv('CALL_OWNER'),
                     runs: globalThis.detachedRuns,
@@ -2989,13 +3066,21 @@ async fn completion_retains_detached_promise_context_until_host_event() {
             .await
             .expect("Host must resume the detached continuation")
             .expect("detached progress"),
-    ).unwrap();
-    assert_eq!(resumed, serde_json::json!({
-        "owner": "original", "runs": 1,
-        "config": "/app/data/extensions/device/plugins/configs/workflow",
-    }));
+    )
+    .unwrap();
     assert_eq!(
-        host.environment.lock().unwrap().get("DETACHED_HOST_OWNER").map(String::as_str),
+        resumed,
+        serde_json::json!({
+            "owner": "original", "runs": 1,
+            "config": "/app/data/extensions/device/plugins/configs/workflow",
+        })
+    );
+    assert_eq!(
+        host.environment
+            .lock()
+            .unwrap()
+            .get("DETACHED_HOST_OWNER")
+            .map(String::as_str),
         Some("original"),
     );
     assert_eq!(executionSessionCounts(&engine).await, (0, 0));
@@ -3078,7 +3163,7 @@ async fn promise_jobs_restore_execution_host_for_native_calls() {
             r#"exports.main = async function() {
             await Promise.resolve();
             var config = ToolPkg.getConfigDir();
-            NativeInterface.setEnv('CONTINUATION_OWNER', 'workflow');
+            __operitNativeSetEnv(String(globalThis.__operitCurrentCallId), 'CONTINUATION_OWNER', 'workflow');
             return { config: config, owner: getEnv('CONTINUATION_OWNER') };
         };"#,
             "main",
@@ -3108,4 +3193,191 @@ async fn promise_jobs_restore_execution_host_for_native_calls() {
         Some("workflow")
     );
     engine.destroy();
+}
+
+/// Exercises real QuickJS bootstrap and generated positional-to-tool bindings.
+#[tokio::test(flavor = "current_thread")]
+async fn edge_io_sdk_aliases_forward_node_interface_args_and_reject_failures() {
+    let host=Arc::new(TestPluginConfigExecutionHost::default());
+    let engine=newTestJsEngine(host.clone());
+    let output=engine.execute_script_function(r#"
+        exports.ports = async function() {
+            if (tools !== Tools) throw Error('different Tools object');
+            if (typeof Tools.Edge !== 'function' || typeof Tools.Io !== 'function') throw Error('static classes missing');
+            if (Tools.edge !== undefined || Tools.io !== undefined) throw Error('noncanonical namespace');
+            try { new Tools.Edge(); throw Error('Edge must not be instantiated'); }
+            catch(error) { if (!String(error).includes('static class')) throw error; }
+            const edge=await Tools.Edge.execute('edge-one',{pluginId:'device.status',action:'read'},{text:'ping'});
+            const io=await Tools.Io.execute('edge-two',{port:'gpio',operation:'read'},{pin:2});
+            let failure='';
+            try { await Tools.Edge.execute('unauthorized',{pluginId:'device.status',action:'read'}); }
+            catch(error) { failure=String(error.message || error); }
+            return {edge:edge.nodeId,io:io.nodeId,failure};
+        };
+    "#,"ports",&testParams(),&BTreeMap::new(),None,true,2000,None).await.unwrap().unwrap();
+    let result:Value=serde_json::from_str(&output).unwrap();
+    assert_eq!(result,serde_json::json!({"edge":"edge-one","io":"edge-two","failure":"Edge node access denied"}));
+    let calls=host.edgePortCalls.lock().unwrap();
+    assert_eq!(calls.len(),3);
+    assert_eq!(calls[0],serde_json::json!({"tool":"edge_execute","params":{"node_id":"edge-one","interface_info":{"pluginId":"device.status","action":"read"},"args":{"text":"ping"}}}));
+    assert_eq!(calls[1],serde_json::json!({"tool":"io_execute","params":{"node_id":"edge-two","interface_info":{"port":"gpio","operation":"read"},"args":{"pin":2}}}));
+    assert!(calls[2]["params"].get("args").is_none()||calls[2]["params"]["args"].is_null());
+    drop(calls);engine.destroy();
+}
+
+/// Preserves JSON-compatible data without executing a JSON text transport.
+#[tokio::test(flavor = "current_thread")]
+async fn structured_tool_calls_preserve_values_and_avoid_json_text() {
+    let engine = newTestJsEngine(Arc::new(TestPluginConfigExecutionHost::default()));
+    let result = engine.execute_script_function(
+            r#"exports.main = async function(params) {
+                var savedStringify = JSON.stringify, savedParse = JSON.parse;
+                var parameters = {
+                    text: '\"\n\u2028中'.repeat(16384),
+                    integer: 7, large: 1e16, date: new Date('2020-01-01T00:00:00Z'),
+                    nested: {x:true, omit:undefined}, array: [undefined, , NaN, 2],
+                    boxed: new Boolean(false), ['__proto__']: {polluted:true},
+                    custom: {toJSON:function(key){return {key:key};}}
+                };
+                JSON.stringify = function(value) {
+                    if(value && value.text===parameters.text) throw new Error('Tool request serialized as text');
+                    return savedStringify.apply(this,arguments);
+                };
+                JSON.parse = function(text) {
+                    if(typeof text==='string' && text.indexOf('"text":')>=0) throw new Error('Tool result parsed from text');
+                    return savedParse.apply(this,arguments);
+                };
+                var output;
+                try { output = await toolCall('echo', parameters); }
+                finally { JSON.stringify=savedStringify; JSON.parse=savedParse; }
+                return {
+                    textMatches:output.text===parameters.text,
+                    integer:output.integer, large:output.large,
+                    date:output.date, nested:output.nested, array:output.array,
+                    boxed:output.boxed, custom:output.custom,
+                    ownProto:Object.prototype.hasOwnProperty.call(output,'__proto__'),
+                    noPollution:output.polluted===undefined
+                };
+            };"#,
+            "main", &BTreeMap::new(),
+            &BTreeMap::new(), None, true, 5, None,
+        ).await;
+    let output: Value = serde_json::from_str(&expect_js_output(result, "structured echo")).unwrap();
+    assert_eq!(
+        output,
+        serde_json::json!({
+            "textMatches":true, "integer":7, "large":10000000000000000u64,
+            "date":"2020-01-01T00:00:00.000Z", "nested":{"x":true},
+            "array":[null,null,null,2], "boxed":false, "custom":{"key":"custom"},
+            "ownProto":true,"noPollution":true
+        })
+    );
+    engine.destroy();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn structured_tool_calls_recover_from_invalid_parameters_and_preserve_binary_results() {
+    let engine = newTestJsEngine(Arc::new(TestPluginConfigExecutionHost::default()));
+    let result = engine
+        .execute_script_function(
+            r#"exports.main = async function() {
+            var failures=[]; var cycle={};cycle.self=cycle;
+            for (var p of [cycle,{big:1n},[],{get x(){throw new Error('getter');}}]) {
+                try {await toolCall('echo',p);failures.push(false);}catch(e){failures.push(true);}
+            }
+            return {failures:failures, good:(await toolCall('echo',{x:42})).x,
+                binary:await toolCall('binary',{})};
+        };"#,
+            "main",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+            true,
+            5,
+            None,
+        )
+        .await;
+    let output: Value =
+        serde_json::from_str(&expect_js_output(result, "invalid parameters recovery")).unwrap();
+    assert_eq!(
+        output,
+        serde_json::json!({"failures":[true,true,true,true],"good":42,"binary":"AQID"})
+    );
+    engine.destroy();
+}
+
+/// Measures structured round trips through the real engine without installing retired adapters.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "manual release bridge benchmark"]
+async fn bridge_roundtrip_benchmark() {
+    let sizes = std::env::var("OPERIT_JS_BRIDGE_BENCH_SIZES")
+        .map(|sizes| {
+            sizes
+                .split(',')
+                .map(|size| {
+                    size.trim()
+                        .parse::<usize>()
+                        .expect("benchmark payload size")
+                })
+                .collect::<Vec<_>>()
+        })
+        .expect("OPERIT_JS_BRIDGE_BENCH_SIZES must explicitly specify payload sizes");
+    let iterations = std::env::var("OPERIT_JS_BRIDGE_BENCH_ITERATIONS")
+        .map(|value| value.parse::<usize>().expect("benchmark iterations"))
+        .expect("OPERIT_JS_BRIDGE_BENCH_ITERATIONS must explicitly specify iteration count");
+    assert!(iterations > 0, "benchmark iterations must be positive");
+    for size in sizes {
+        let engine = newTestJsEngine(Arc::new(TestPluginConfigExecutionHost::default()));
+        let params = BTreeMap::from([
+            ("size".to_string(), serde_json::json!(size)),
+            ("iterations".to_string(), serde_json::json!(iterations)),
+        ]);
+        let script = r#"exports.main=async function(params){
+            var data={text:'x'.repeat(params.size)}, result;
+            for(var i=0;i<params.iterations;i++)result=await toolCall('echo',data);
+            return result.text.length;
+        };"#;
+        expect_js_output(
+            engine
+                .execute_script_function(
+                    script,
+                    "main",
+                    &params,
+                    &BTreeMap::new(),
+                    None,
+                    true,
+                    30,
+                    None,
+                )
+                .await,
+            "warmup",
+        );
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            let start = Instant::now();
+            let output = expect_js_output(
+                engine
+                    .execute_script_function(
+                        script,
+                        "main",
+                        &params,
+                        &BTreeMap::new(),
+                        None,
+                        true,
+                        30,
+                        None,
+                    )
+                    .await,
+                "benchmark",
+            );
+            assert_eq!(output, size.to_string());
+            times.push(start.elapsed().as_secs_f64() * 1e6 / iterations as f64);
+        }
+        times.sort_by(|a, b| a.total_cmp(b));
+        eprintln!(
+            "BRIDGE_BENCH payload={size}B mode=structured median_us_per_roundtrip={:.3}",
+            times[2]
+        );
+        engine.destroy();
+    }
 }

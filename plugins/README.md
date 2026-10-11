@@ -33,3 +33,11 @@ Reloading discards unsaved plugin UI state and recreates plugin execution engine
 The VM service must be reachable from this computer (including the forwarded
 port used by Flutter for a connected phone). Keep the authenticated URL private.
 `--no-hot-reload` disables remote delivery explicitly.
+
+## Edge hardware ports
+
+See [Core 插件调用 Edge 硬件端口](docs/edge-ports.md) for the initial `Tools.Edge.execute` /
+`Tools.Io.execute` APIs, bounded payloads, authorization and the GPIO-only scope.
+Serial streaming/session support is not implemented yet.
+
+Generic Edge-to-Core action events and the `on_edge_event` listener are documented in [edge-events.md](docs/edge-events.md).

@@ -1865,10 +1865,14 @@ dependencies = [
  "operit-host-api",
  "operit-link",
  "operit-node-runtime",
+ "operit-plugin-sdk",
  "operit-plugin-sdk-ipc",
  "operit-plugin-sdk-ipc-bridge",
  "operit-proxy-local",
  "operit-runtime",
+ "operit-tools",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1877,6 +1881,7 @@ version = "0.1.0"
 dependencies = [
  "operit-link",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1944,6 +1949,7 @@ version = "0.1.0"
 dependencies = [
  "operit-host-api",
  "rquickjs",
+ "serde_json",
  "tokio",
 ]
 
@@ -2037,6 +2043,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -2288,6 +2295,7 @@ dependencies = [
  "js-sys",
  "json5",
  "md-5",
+ "operit-edge-contract",
  "operit-host-api",
  "operit-js-bridge",
  "operit-link",
@@ -2356,6 +2364,8 @@ dependencies = [
  "json5",
  "md-5",
  "operit-host-api",
+ "operit-host-native-scheduler",
+ "operit-host-native-storage",
  "operit-link",
  "operit-model",
  "operit-plugin-sdk",

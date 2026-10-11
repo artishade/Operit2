@@ -3,7 +3,7 @@ use operit_host_api::TimeUtils::currentTimeMillis;
 use operit_link::protocol::LinkDeviceInfo;
 use operit_link::{fromCoreValue, toCoreValue, CoreCallRequest, CoreValue, CORE_INTERNAL_TARGET};
 use operit_store::CoreNodeBindingStore::CoreNodeBindingStore;
-use operit_store::CoreSpaceStore::{CoreSpace, CoreSpaceDeviceProfile, CoreSpaceStore};
+use operit_store::CoreSpaceStore::{CoreSpace, CoreSpaceDeviceProfile, CoreSpaceRoutePlan, CoreSpaceStore};
 use operit_store::NetworkControlStore::{
     NetworkControlAuditRecord, NetworkControlIdentityAssignment, NetworkControlRole,
     NetworkControlState, NetworkControlStore,
@@ -27,8 +27,16 @@ use crate::{
 // The same admission state machine is used by full Core and lightweight Edge.
 pub use crate::NodeSpaceService::{SpaceJoinRequest, SpaceJoinStatus};
 pub(crate) use crate::NodeSpaceService::PeerSpaceSnapshot;
-pub(crate) use crate::NodeSpaceService::{NODE_SPACE_TARGET, NODE_SPACE_APPROVAL_TARGET};
+pub(crate) use crate::NodeSpaceService::{
+    NODE_SPACE_TARGET, NODE_SPACE_APPROVAL_TARGET, NODE_SPACE_CONTROL_TARGET, space_reconcile,
+};
 use crate::NodeSpaceService::space_join;
+
+/// One delivery attempt per removal notice; the removal never blocks on it.
+const REMOVAL_NOTICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Total budget for the whole notice phase; partial delivery stays best-effort.
+const REMOVAL_NOTICES_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// 已配对设备的展示投影；不暴露底层会话、端点或传输选择。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimePairedDevice {
@@ -57,6 +65,12 @@ pub struct RuntimeDeviceSpaceDevice {
     pub model: String,
     pub coreVersion: Option<String>,
     pub online: bool,
+    /// Peer Links one routed request traverses; reported only for multi-hop members.
+    #[serde(default)]
+    pub relayHops: Option<u32>,
+    /// Hop node ids from the first hop through the member; reported only for multi-hop members.
+    #[serde(default)]
+    pub relayPath: Option<Vec<String>>,
     pub currentIdentity: Option<RuntimeDeviceSpaceIdentity>,
 }
 
@@ -73,6 +87,8 @@ pub enum RuntimeDeviceSpaceConnectionStatus {
     Online,
     Offline,
     VersionMismatch,
+    /// Announced by its owning device; the local device cannot observe the link directly.
+    Announced,
     Unknown,
 }
 
@@ -214,7 +230,8 @@ impl RuntimeRemoteLinkService {
 
     fn writeDeviceProfile(&self, info: &LinkDeviceInfo) -> Result<(), String> {
         self.spaceStore.writeLocalDeviceProfile(info.displayName(), info.platform.clone(),
-            info.model.clone(), operit_runtime::CORE_VERSION.to_string()).map(|_| ())
+            info.model.clone(), operit_runtime::CORE_VERSION.to_string(),
+            info.pairingIncarnation.clone()).map(|_| ())
     }
 
     /// Returns the converged Space membership owned by this CoreNode.
@@ -355,13 +372,132 @@ impl RuntimeRemoteLinkService {
     /// every local pairing credential is removed while its live Peer Link ends.
     /// The device returns to stranger state — reconnecting requires a fresh
     /// pairing plus a new join approval.
+    ///
+    /// Before the local erase completes, one best-effort removal notice goes to
+    /// the removed device and to every device this removal cuts off, so a
+    /// bridge's far side learns the removal instead of staying in a stale view.
     #[allow(non_snake_case)]
     pub async fn removeDeviceSpaceMember(&self, deviceId: String) -> Result<(), String> {
+        // Links and routes are captured before the policy change: removing one
+        // device can cut devices that were only reachable through it, and the
+        // notice needs the first hop that still reaches them.
+        let notices = self.captureRemovalNotices()?;
         self.networkControlStore.removeMember(deviceId.clone())?;
+        if tokio::time::timeout(
+            REMOVAL_NOTICES_BUDGET,
+            self.deliverRemovalNotices(&deviceId, notices),
+        )
+        .await
+        .is_err()
+        {
+            operit_util::AppLogger::AppLogger::w(
+                "RuntimeRemoteLinkService",
+                &format!("Removal notice phase exhausted its budget removed={deviceId}"),
+            );
+        }
         self.spaceStore.removeRemoteMember(deviceId.clone())?;
         space_join::purgeDevice(self, &deviceId)?;
         self.nodeServices()?.peers().removePairedPeer(&deviceId).await
             .map_err(|error| error.to_string())
+    }
+
+    /// Captures the first hop that currently reaches every other member.
+    fn captureRemovalNotices(&self) -> Result<Vec<(String, String)>, String> {
+        let mut notices = Vec::new();
+        for nodeId in self.spaceStore.space()?.members {
+            if nodeId == self.nodeRouter.localNodeId() { continue; }
+            if let Some(plan) = self.nodeRouter.nodeRoutePlan(&nodeId)? {
+                notices.push((nodeId, plan.firstHop().to_string()));
+            }
+        }
+        Ok(notices)
+    }
+
+    /// Delivers one best-effort control exchange along the captured route. The
+    /// notice carries the ordinary control log, so the receiving side
+    /// replay-validates it exactly like a normal synchronization and never
+    /// acts on a bare claim. Failures never block the removal.
+    async fn deliverRemovalNotices(&self, removedNodeId: &str, notices: Vec<(String, String)>) {
+        let operations = match self.networkControlStore.currentSpaceOperations() {
+            Ok(operations) => operations,
+            Err(error) => {
+                operit_util::AppLogger::AppLogger::w(
+                    "RuntimeRemoteLinkService",
+                    &format!("Removal notice skipped removed={removedNodeId} error={error}"),
+                );
+                return;
+            }
+        };
+        let args = match toCoreValue(operations) {
+            Ok(args) => args,
+            Err(error) => {
+                operit_util::AppLogger::AppLogger::w(
+                    "RuntimeRemoteLinkService",
+                    &format!("Removal notice encoding failed removed={removedNodeId} error={error}"),
+                );
+                return;
+            }
+        };
+        for (nodeId, firstHop) in &notices {
+            // Members that stay reachable keep learning through the normal
+            // synchronization loop; only the cut-off devices need this push.
+            if nodeId != removedNodeId
+                && self.nodeRouter.nodeIsReachable(nodeId).unwrap_or(false)
+            {
+                continue;
+            }
+            // The removed device is notified last: its own notice retires it,
+            // and a retired bridge would reject the exchange it must still
+            // forward for the far side.
+            if nodeId == removedNodeId { continue; }
+            self.deliverRemovalNotice(nodeId, firstHop, &args).await;
+        }
+        if let Some((nodeId, firstHop)) = notices
+            .iter()
+            .find(|(nodeId, _)| nodeId == removedNodeId)
+            .cloned()
+        {
+            self.deliverRemovalNotice(&nodeId, &firstHop, &args).await;
+        }
+    }
+
+    /// Delivers one removal notice along the captured first hop.
+    async fn deliverRemovalNotice(&self, nodeId: &str, firstHop: &str, args: &CoreValue) {
+        let request = CoreCallRequest::new(
+            operit_link::nextCoreRouteRequestId("space-removal-notice"),
+            NODE_SPACE_CONTROL_TARGET,
+            "exchange",
+            args.clone(),
+        );
+        let delivery = self
+            .nodeRouter
+            .sendSpaceEnvelopeAlongHop(firstHop, nodeId, request);
+        match tokio::time::timeout(REMOVAL_NOTICE_TIMEOUT, delivery).await {
+            Ok(response) if response.result.is_ok() => {}
+            Ok(response) => {
+                operit_util::AppLogger::AppLogger::w(
+                    "RuntimeRemoteLinkService",
+                    &format!(
+                        "Removal notice rejected target={nodeId} hop={firstHop} error={:?}",
+                        response.result.err()
+                    ),
+                );
+            }
+            Err(_) => {
+                operit_util::AppLogger::AppLogger::w(
+                    "RuntimeRemoteLinkService",
+                    &format!("Removal notice timed out target={nodeId} hop={firstHop}"),
+                );
+            }
+        }
+    }
+
+    /// Retires this device once the shared policy removed it, dropping every
+    /// pairing it held at that moment. The removal forgets immediately: a
+    /// deferred delete cannot tell those pairings from ones created later by
+    /// pairing again for re-admission.
+    pub(crate) async fn retireRemovedDevice(&self) -> Result<bool, String> {
+        Ok(space_join::retireRemovedLocalDevice(self, None)?.is_some())
     }
 
     /// Prohibits one device from direct connection and route transit immediately.
@@ -390,11 +526,16 @@ impl RuntimeRemoteLinkService {
                 let profile = profiles.get(&deviceId).ok_or_else(|| {
                     format!("Device profile is missing in the current device space: {deviceId}")
                 })?;
-                let online =
-                    deviceId == currentDeviceId || self.nodeRouter.nodeIsReachable(&deviceId)?;
+                let routePlan = if deviceId == currentDeviceId {
+                    None
+                } else {
+                    self.nodeRouter.nodeRoutePlan(&deviceId)?
+                };
+                let online = deviceId == currentDeviceId || routePlan.is_some();
                 Ok(runtimeDeviceSpaceDevice(
                     profile,
                     online,
+                    routePlan.as_ref(),
                     runtimeDeviceSpaceIdentity(&controlState, &deviceId),
                 ))
             })
@@ -455,6 +596,7 @@ impl RuntimeRemoteLinkService {
         Ok(runtimeDeviceSpaceDevice(
             &profile,
             true,
+            None,
             runtimeDeviceSpaceIdentity(&controlState, &profile.nodeId),
         ))
     }
@@ -560,6 +702,7 @@ impl RuntimeRemoteLinkService {
                     .map_err(|error| error.to_string())
             },
             "requestJoin" | "joinStatus" | "cancelJoin" => space_join::receive(self, peerNodeId, request),
+            "reconcileSharedSpace" => space_reconcile::receive(self, peerNodeId, request),
             "join" => Err("SPACE_JOIN_APPROVAL_REQUIRED: Submit a join request for local approval first".into()),
             _ => Err("Unknown node Space method".into()),
         }
@@ -586,6 +729,7 @@ impl RuntimeRemoteLinkService {
                         deviceInfo: LinkDeviceInfo {
                             platform: String::new(),
                             model: peer.displayName.clone(),
+                            pairingIncarnation: peer.pairingIncarnation.clone(),
                         },
                         inbound: peer.inbound,
                         outbound: peer.outbound,
@@ -939,8 +1083,15 @@ impl RuntimeRemoteLinkService {
 fn runtimeDeviceSpaceDevice(
     profile: &CoreSpaceDeviceProfile,
     online: bool,
+    routePlan: Option<&CoreSpaceRoutePlan>,
     currentIdentity: Option<RuntimeDeviceSpaceIdentity>,
 ) -> RuntimeDeviceSpaceDevice {
+    // Only a plan with more than one hop reports a relay: a single-hop plan is the
+    // direct Peer Link the local device already observes itself.
+    let (relayHops, relayPath) = match routePlan {
+        Some(plan) if plan.hops() > 1 => (Some(plan.hops()), Some(plan.path.clone())),
+        _ => (None, None),
+    };
     RuntimeDeviceSpaceDevice {
         deviceId: profile.nodeId.clone(),
         userName: profile.userName.clone(),
@@ -949,6 +1100,8 @@ fn runtimeDeviceSpaceDevice(
         model: profile.model.clone(),
         coreVersion: profile.coreVersion.clone(),
         online,
+        relayHops,
+        relayPath,
         currentIdentity,
     }
 }
@@ -1003,9 +1156,11 @@ fn runtimeDeviceSpaceConnectionState(
         reasons.push("Core version is unavailable".to_string());
         RuntimeDeviceSpaceConnectionStatus::Unknown
     } else if directlyOnline.is_none() {
-        reasons
-            .push("Direct Peer Link status is not observable from the current device".to_string());
-        RuntimeDeviceSpaceConnectionStatus::Unknown
+        reasons.push(
+            "Announced by its owning device; the local device cannot observe this link directly"
+                .to_string(),
+        );
+        RuntimeDeviceSpaceConnectionStatus::Announced
     } else {
         RuntimeDeviceSpaceConnectionStatus::Online
     };

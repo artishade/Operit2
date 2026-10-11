@@ -27,6 +27,11 @@ pub struct PairedPeer {
     pub displayName: String,
     pub inbound: bool,
     pub outbound: bool,
+    /// The peer's pairing generation as announced in the handshake. Mutual
+    /// forgetting drops this credential only when a removal revokes exactly
+    /// this generation; absent on records from older cores.
+    #[serde(default)]
+    pub pairingIncarnation: Option<String>,
 }
 
 /// 只供本地操作界面展示，不通过匿名 Link 请求返回。
@@ -36,6 +41,19 @@ pub struct PairingPrompt {
     pub peerNodeId: String,
     pub displayName: String,
     pub confirmationCode: String,
+}
+
+/// Volatile transport identity, not a Binding or a business-state replica.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpaceClientIdentity {
+    pub spaceId: String,
+    pub peerNodeId: String,
+    pub generation: String,
+}
+
+pub struct SpaceClientConnection {
+    pub identity: SpaceClientIdentity,
+    pub client: Arc<dyn operit_link::CoreLinkSharedClient + Send + Sync>,
 }
 
 /// 一个节点共享一个实例；业务操作由注入的 RuntimePeerService 负责。
@@ -126,6 +144,7 @@ mod tests {
                 displayName: "board".into(),
                 inbound: false,
                 outbound: true,
+                pairingIncarnation: None,
             }])
         }
         fn outboundPeerNodeIds(&self) -> Result<std::collections::BTreeSet<String>, CoreLinkError> {
@@ -151,6 +170,12 @@ mod tests {
         }
         async fn removePairedPeer(&self, id: &str) -> Result<(), CoreLinkError> {
             self.calls.lock().unwrap().push(format!("remove:{id}"));
+            Ok(())
+        }
+        fn forgetPairingRecords(&self, nodeIds: &[String]) -> Result<(), CoreLinkError> {
+            for id in nodeIds {
+                self.calls.lock().unwrap().push(format!("forget:{id}"));
+            }
             Ok(())
         }
         /// Declares the listener operations recorded by this injected test service.

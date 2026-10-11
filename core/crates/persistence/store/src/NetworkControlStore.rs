@@ -68,6 +68,13 @@ pub enum NetworkControlCommand {
     },
     RemoveMember {
         nodeId: String,
+        /// The pairing generation the removed device announced while admitted.
+        /// Mutual forgetting drops only pairings stamped with this generation:
+        /// a pairing the device made after leaving and resetting (its next
+        /// generation, for re-admission) survives every replay of this removal.
+        /// Older cores omit it and keep the previous forget-only semantics.
+        #[serde(default)]
+        revokedIncarnation: Option<String>,
     },
     DisconnectNode {
         nodeId: String,
@@ -302,7 +309,11 @@ impl NetworkControlStore {
     #[allow(non_snake_case)]
     pub fn removeMember(&self, nodeId: String) -> Result<SyncOperation, String> {
         validateNodeId(&nodeId)?;
-        self.submitLocalCommand(NetworkControlCommand::RemoveMember { nodeId })
+        // The removal revokes the generation this device announced while it
+        // was admitted; a stale local profile simply carries an older value.
+        let revokedIncarnation = self.spaceStore.deviceProfiles()?
+            .get(&nodeId).and_then(|profile| profile.pairingIncarnation.clone());
+        self.submitLocalCommand(NetworkControlCommand::RemoveMember { nodeId, revokedIncarnation })
     }
 
     /// Admits one authenticated device as a member of the current Space.
@@ -608,6 +619,10 @@ impl NetworkControlStore {
             issuerNodeId: self.localNodeId.clone(),
             command,
         };
+        // Field validation must precede the durable append. decode-time validation
+        // alone lets a malformed command into the log, where every later replay
+        // fails and permanently breaks this Space's control-plane materialization.
+        validateCommandRecord(&record)?;
         if self.nodeLocalOnly {
             let sequence = self.orderedCommands(spaceId)?.iter()
                 .filter(|op| op.originDeviceId == self.localNodeId)
@@ -825,7 +840,7 @@ fn controlAuditSummary(
                 .collect::<Result<Vec<_>, _>>()?;
             format!("Merge Space {sourceSpaceId}; admit {}", labels.join(", "))
         }
-        NetworkControlCommand::RemoveMember { nodeId } => {
+        NetworkControlCommand::RemoveMember { nodeId, .. } => {
             format!("Remove device {}", controlDeviceLabel(profiles, nodeId)?)
         }
         NetworkControlCommand::DisconnectNode { nodeId } => format!(
@@ -922,7 +937,7 @@ fn validateCommandRecord(record: &NetworkControlCommandRecord) -> Result<(), Str
             Ok(())
         }
         NetworkControlCommand::AdmitMember { nodeId }
-        | NetworkControlCommand::RemoveMember { nodeId }
+        | NetworkControlCommand::RemoveMember { nodeId, .. }
         | NetworkControlCommand::DisconnectNode { nodeId } => validateNodeId(nodeId),
         NetworkControlCommand::PolicyUpdate { policyId, value } => {
             validateIdentifier("policy id", policyId, 160)?;
@@ -1078,7 +1093,7 @@ fn authorizeAndApplyCommand(
             }
             Ok(())
         }
-        NetworkControlCommand::RemoveMember { nodeId } => {
+        NetworkControlCommand::RemoveMember { nodeId, .. } => {
             requireCapability(
                 state,
                 &record.issuerNodeId,

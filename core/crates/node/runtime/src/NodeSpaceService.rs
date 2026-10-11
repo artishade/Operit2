@@ -58,6 +58,12 @@ pub struct SpaceJoinRequest {
 
 #[path = "peer/space_join.rs"]
 pub(crate) mod space_join;
+#[path = "peer/space_reconcile.rs"]
+pub(crate) mod space_reconcile;
+#[path = "peer/space_doctor.rs"]
+pub(crate) mod space_doctor;
+#[path = "peer/space_topology.rs"]
+pub(crate) mod space_topology;
 
 /// Hooks provided by the existing node runtime, not a second wire protocol.
 #[async_trait::async_trait(?Send)]
@@ -197,6 +203,7 @@ impl NodeSpaceService {
                 toCoreValue(self.space.observePairedDeviceSpace(peer.to_string(), space)?).map_err(|e| e.to_string())
             }
             "requestJoin" | "joinStatus" | "cancelJoin" => space_join::receive(self, peer, request),
+            "reconcileSharedSpace" => space_reconcile::receive(self, peer, request),
             "join" => Err("SPACE_JOIN_APPROVAL_REQUIRED: Submit a join request for local approval first".into()),
             _ => Err("Unknown node Space method".into()),
         }
@@ -260,6 +267,10 @@ impl NodeSpaceContext for NodeSpaceService {
         let response = self.callNode(peer.clone(), request).await;
         let operations = decodeControlExchange(response.result)?;
         self.control.projectPeerControlOperations(&peer, &operations)?;
+        // The joined log carries the Space's whole removal history: stale
+        // member projections shrink and the credentials a removal revoked are
+        // forgotten in the same step.
+        space_join::applyRemovedMemberLocalEffects(self, &operations)?;
         Ok(())
     }
 }
@@ -278,6 +289,12 @@ pub fn acceptSpaceControlCall(service: &dyn NodeSpaceContext, origin: &str, requ
     if request.methodName != "exchange" { return Err("Unknown Space control method".into()); }
     let operations: Vec<SyncOperation> = fromCoreValue(request.args).map_err(|error| error.to_string())?;
     service.networkControlStore().projectPeerControlOperations(origin, &operations)?;
+    // Removals take effect locally whatever path delivered them: this device
+    // retires itself when the command targets it, shrinks its own member
+    // projection for every other removed device, and forgets the pairing
+    // credentials the removal revoked.
+    space_join::retireRemovedLocalDevice(service, None)?;
+    space_join::applyRemovedMemberLocalEffects(service, &operations)?;
     toCoreValue(service.networkControlStore().currentSpaceOperations()?).map_err(|error| error.to_string())
 }
 

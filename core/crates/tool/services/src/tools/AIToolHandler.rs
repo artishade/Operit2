@@ -22,8 +22,8 @@ use operit_tools::tools::ToolRegistration::registerAllTools;
 use operit_tools::tools::ToolResultDataClasses::{stringResultData, ToolResultData};
 use operit_tools::ConversationMarkupManager::ToolResult;
 use operit_tools::ToolExecutionManager::{
-    AsyncToolExecutor, RegisteredToolExecutor, ToolInvocationFuture, AITool, ToolAccessSpec, ToolBoundary, ToolEffect, ToolExecutionManager, ToolExecutor,
-    ToolParameter, ToolValidationResult,
+    AITool, AsyncToolExecutor, RegisteredToolExecutor, ToolAccessSpec, ToolBoundary, ToolEffect,
+    ToolExecutionManager, ToolExecutor, ToolInvocationFuture, ToolParameter, ToolValidationResult,
 };
 use operit_util::ChainLogger::{self, TOOL_CHAIN};
 use operit_util::LocaleUtils::LocaleUtils;
@@ -131,7 +131,8 @@ impl AIToolHandler {
         plugin_id: &str,
         scope: &str,
     ) -> Result<String, String> {
-        let root = operit_store::ExtensionStore::ExtensionStore::configPathForScope(owner_id, scope)?;
+        let root =
+            operit_store::ExtensionStore::ExtensionStore::configPathForScope(owner_id, scope)?;
         let path = if plugin_id == owner_id {
             root
         } else {
@@ -145,7 +146,8 @@ impl AIToolHandler {
             .ok_or("FileSystemHost is required for plugin configuration")?
             .makeDirectory(&configDir.to_string_lossy(), true)
             .map_err(|error| error.to_string())?;
-        let relative = path.strip_prefix("runtime/")
+        let relative = path
+            .strip_prefix("runtime/")
             .ok_or("Configuration is outside runtime storage")?;
         PathMapper::joinVfsPath("/app/data", relative)
     }
@@ -573,8 +575,6 @@ impl AIToolHandler {
             .insert(name, ToolRegistrationVisibility::PUBLIC);
     }
 
-
-
     /// Returns the configured visibility for one tool.
     #[allow(non_snake_case)]
     pub fn getToolVisibility(&self, toolName: &str) -> Option<ToolRegistrationVisibility> {
@@ -666,7 +666,13 @@ impl AIToolHandler {
 
     /// Ensures default or package tools are registered, then reports whether a tool exists.
     #[allow(non_snake_case)]
-    pub fn getToolExecutorOrActivate(&mut self, toolName: &str) -> bool {
+    pub async fn getToolExecutorOrActivate(&mut self, toolName: &str) -> bool {
+        if let Some((packageName, _)) = toolName.split_once(':') {
+            let manager = self.getOrCreatePackageManager();
+            if RuntimePackageManager::prepareMcpPackage(&manager, packageName.trim()).await.is_err() {
+                return false;
+            }
+        }
         if self.hasToolExecutor(toolName) {
             if let Some((packageName, _)) = toolName.split_once(':') {
                 let packageName = packageName.trim();
@@ -728,7 +734,7 @@ impl AIToolHandler {
     #[allow(non_snake_case)]
     fn isMcpServiceActive(&self, packageName: &str) -> bool {
         let mcpManager = MCPManager::getInstance(self.getContext());
-        let Some(client) = mcpManager.getOrCreateClient(packageName) else {
+        let Some(client) = mcpManager.getClientForMetadata(packageName) else {
             return false;
         };
         client
@@ -759,7 +765,7 @@ impl AIToolHandler {
         for packageTool in executableTools {
             let toolName = format!("{}:{}", toolPackage.name, packageTool.name);
             if isMcpPackage {
-                self.registerTool(
+                self.registerAsyncTool(
                     toolName,
                     Box::new(MCPToolExecutor::new(MCPManager::getInstance(
                         context.clone(),
@@ -795,7 +801,8 @@ impl AIToolHandler {
                 result: stringResultData(""),
                 error: Some(error.to_string()),
             })?;
-        let workspaceBoundary = Self::checkWorkspaceBoundary(&mode, tool, &accessSpec);
+        let context = self.getContext();
+        let workspaceBoundary = Self::checkWorkspaceBoundary(&mode, tool, &accessSpec, context.runtimeStorageHost.as_ref());
         let policyOverrideReason = match (mode.allowsEffect(accessSpec.effect), workspaceBoundary) {
             (_, Err(WorkspaceBoundaryError::InvalidRequest(error))) => {
                 return Err(ToolResult {
@@ -878,6 +885,7 @@ impl AIToolHandler {
         mode: &AiPermissionMode,
         tool: &AITool,
         accessSpec: &ToolAccessSpec,
+        storage: Option<&Arc<dyn operit_host_api::RuntimeStorageHost>>,
     ) -> Result<(), WorkspaceBoundaryError> {
         if *mode == AiPermissionMode::Full {
             return Ok(());
@@ -885,14 +893,14 @@ impl AIToolHandler {
         match &accessSpec.boundary {
             ToolBoundary::None => Ok(()),
             ToolBoundary::FilePath { effect } => {
-                Self::checkWorkspaceWritePath(tool, "path", *effect)
+                Self::checkWorkspaceWritePath(tool, "path", *effect, storage)
             }
             ToolBoundary::FilePair {
                 source,
                 destination,
             } => {
-                Self::checkWorkspaceWritePath(tool, "source", *source)?;
-                Self::checkWorkspaceWritePath(tool, "destination", *destination)
+                Self::checkWorkspaceWritePath(tool, "source", *source, storage)?;
+                Self::checkWorkspaceWritePath(tool, "destination", *destination, storage)
             }
         }
     }
@@ -902,6 +910,7 @@ impl AIToolHandler {
         tool: &AITool,
         parameterName: &str,
         effect: ToolEffect,
+        storage: Option<&Arc<dyn operit_host_api::RuntimeStorageHost>>,
     ) -> Result<(), WorkspaceBoundaryError> {
         if effect == ToolEffect::READ {
             return Ok(());
@@ -940,8 +949,16 @@ impl AIToolHandler {
             ));
         }
 
-        let paths = RuntimeStorePaths::default();
-        let mapper = PathMapper::new(paths.runtime_dir().to_path_buf(), paths.workspace_dir());
+        let storage = storage.ok_or_else(|| WorkspaceBoundaryError::RequiresApproval(
+            "File tool execution requires its runtime storage Host".to_string()
+        ))?;
+        let runtimeRoot = storage.runtimeRootDir().ok_or_else(|| WorkspaceBoundaryError::InvalidRequest(
+            "Runtime storage Host does not expose its runtime root".to_string()
+        ))?;
+        let workspaceRoot = storage.workspaceRootDir().ok_or_else(|| WorkspaceBoundaryError::InvalidRequest(
+            "Runtime storage Host does not expose its workspace root".to_string()
+        ))?;
+        let mapper = PathMapper::new(runtimeRoot, workspaceRoot, storage.clone());
         let resolvedPath = mapper
             .resolve(path)
             .map_err(WorkspaceBoundaryError::InvalidRequest)?;
@@ -1000,7 +1017,7 @@ impl AIToolHandler {
                 ("parameters", parameterSummary.clone()),
             ],
         );
-        if !self.getToolExecutorOrActivate(&tool.name) {
+        if !self.getToolExecutorOrActivate(&tool.name).await {
             ChainLogger::warn(
                 TOOL_CHAIN,
                 "tool.stream.not_found",
@@ -1176,7 +1193,7 @@ impl AIToolHandler {
             self.notifyToolExecutionFinished(&tool);
             return result;
         }
-        self.getToolExecutorOrActivate(&tool.name);
+        self.getToolExecutorOrActivate(&tool.name).await;
         let Some(mut executor) = self.takeToolExecutorForExecution(&tool.name).await else {
             let notFoundResult = ToolResult {
                 toolName: tool.name.clone(),
@@ -1501,12 +1518,16 @@ impl JsExecutionHost for AIToolHandler {
     }
 
     /// Reads one ToolPkg text resource.
-    fn read_toolpkg_text_resource(&self, target: &str, path: &str) -> Result<String, String> {
-        self.getOrCreatePackageManager()
+    fn read_toolpkg_text_resource(
+        &self,
+        target: &str,
+        path: &str,
+    ) -> Result<Option<String>, String> {
+        Ok(self
+            .getOrCreatePackageManager()
             .lock()
             .expect("package manager mutex poisoned")
-            .readToolPkgTextResource(target, path, true)
-            .ok_or_else(|| format!("ToolPkg text resource not found: {target}/{path}"))
+            .readToolPkgTextResource(target, path, true))
     }
 
     /// Materializes one ToolPkg binary resource.
@@ -1531,19 +1552,22 @@ impl JsExecutionHost for AIToolHandler {
     /// Dispatches one Compose DSL controller command.
     fn handle_compose_webview_controller_command(
         &self,
-        payload_json: &str,
-    ) -> Result<String, String> {
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         self.getContext()
             .composeDslWebViewHost
             .as_ref()
             .ok_or_else(|| "ComposeDslWebViewHost is not registered".to_string())?
-            .handleControllerCommand(payload_json)
+            .handleControllerCommand(payload)
             .map_err(|error| error.to_string())
     }
 
-    /// Decodes and forwards one Compose DSL file-picker request to the registered host owner.
-    fn open_compose_file_picker(&self, payload_json: &str) -> Result<String, String> {
-        let request = operit_host_api::ComposeDslFilePickerRequest::parse(payload_json)
+    /// Validates and forwards one structured file-picker request to the registered host owner.
+    fn open_compose_file_picker(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let request = operit_host_api::ComposeDslFilePickerRequest::fromValue(payload.clone())
             .map_err(|error| error.to_string())?;
         self.getContext()
             .composeDslWebViewHost
@@ -1825,6 +1849,7 @@ mod tests {
             &AiPermissionMode::Full,
             &pathTool("/mnt/android/sdcard"),
             &filePathAccessSpec(ToolEffect::READ),
+            None,
         );
 
         assert_eq!(result, Ok(()));
@@ -1837,11 +1862,13 @@ mod tests {
             &AiPermissionMode::ReadOnly,
             &pathTool("/mnt/android/sdcard"),
             &filePathAccessSpec(ToolEffect::READ),
+            None,
         );
         let workspaceWriteResult = AIToolHandler::checkWorkspaceBoundary(
             &AiPermissionMode::WorkspaceWrite,
             &pathTool("/mnt/android/sdcard"),
             &filePathAccessSpec(ToolEffect::READ),
+            None,
         );
 
         assert_eq!(readOnlyResult, Ok(()));
@@ -1855,6 +1882,7 @@ mod tests {
             &AiPermissionMode::WorkspaceWrite,
             &pathTool("/mnt/android/sdcard"),
             &filePathAccessSpec(ToolEffect::WRITE),
+            None,
         );
 
         assert_eq!(

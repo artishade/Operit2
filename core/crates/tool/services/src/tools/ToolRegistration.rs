@@ -166,14 +166,23 @@ fn registerPublicTools(handler: &mut AIToolHandler, context: &HostManager) {
                     };
                     let result = serde_json::json!({
                         "currentNodeId": state.currentNodeId,
-                        "nodes": state.nodes.into_iter().map(|node| serde_json::json!({
-                            "nodeId": node.nodeId,
-                            "displayName": node.displayName,
-                            "userName": node.userName,
-                            "platform": node.platform,
-                            "model": node.model,
-                            "reachable": node.reachable,
-                        })).collect::<Vec<_>>(),
+                        "nodes": state.nodes.into_iter().map(|node| {
+                            let mut encoded = serde_json::json!({
+                                "nodeId": node.nodeId,
+                                "displayName": node.displayName,
+                                "userName": node.userName,
+                                "platform": node.platform,
+                                "model": node.model,
+                                "reachable": node.reachable,
+                            });
+                            if let Some(relayHops) = node.relayHops {
+                                encoded["relayHops"] = serde_json::json!(relayHops);
+                            }
+                            if let Some(relayPath) = node.relayPath {
+                                encoded["relayPath"] = serde_json::json!(relayPath);
+                            }
+                            encoded
+                        }).collect::<Vec<_>>(),
                     });
                     ToolResult {
                         toolName: tool.name.clone(),
@@ -208,6 +217,7 @@ fn registerPublicTools(handler: &mut AIToolHandler, context: &HostManager) {
                 }
             }),
             invoke: {
+                let runtimeSupport = coreNodeRuntimeSupport.clone();
                 Arc::new(move |tool| {
                     let targetNodeId = tool
                         .parameters
@@ -217,6 +227,16 @@ fn registerPublicTools(handler: &mut AIToolHandler, context: &HostManager) {
                         .value
                         .trim()
                         .to_string();
+                    // The actual Binding move happens after this model turn ends;
+                    // without a pre-flight check every invalid target would only
+                    // fail asynchronously, leaving the tool result claiming success.
+                    let state = match runtimeSupport.coreNodeRouteState() {
+                        Ok(state) => state,
+                        Err(error) => return toolErrorResult(tool, error),
+                    };
+                    if let Some(error) = switchCoreTargetError(&state, &targetNodeId) {
+                        return toolErrorResult(tool, error);
+                    }
                     ToolResult {
                         toolName: tool.name.clone(),
                         success: true,
@@ -256,14 +276,21 @@ fn registerPublicTools(handler: &mut AIToolHandler, context: &HostManager) {
     let usePackageHandler = handler.clone();
     handler.registerBuiltinTool(
         BuiltinToolName::UsePackage,
-        Box::new(FnToolExecutor {
+        crate::ToolExecutionManager::RegisteredToolExecutor::Asynchronous(Box::new(AsyncFnToolExecutor {
             effect: ToolEffect::WRITE,
             validate: Arc::new(|_| ToolValidationResult {
                 valid: true,
                 errorMessage: String::new(),
             }),
             invoke: Arc::new(move |tool| {
+                let usePackageManager = usePackageManager.clone();
+                let usePackageHandler = usePackageHandler.clone();
+                Box::pin(async move {
+                let tool = &tool;
                 let packageName = requiredParameterValue(tool, "package_name");
+                if let Err(error) = RuntimePackageManager::prepareMcpPackage(&usePackageManager, &packageName).await {
+                    return toolErrorResult(tool, error);
+                }
                 let (result, selectedPackage) = {
                     let mut guard = usePackageManager
                         .lock()
@@ -286,8 +313,9 @@ fn registerPublicTools(handler: &mut AIToolHandler, context: &HostManager) {
                     );
                 }
                 result
+                })
             }),
-        }),
+        })),
         ToolRegistrationVisibility::PUBLIC,
     );
     let searchContext = context.clone();
@@ -955,6 +983,18 @@ fn registerBluetoothTool(
 
 #[allow(non_snake_case)]
 fn registerInternalTools(handler: &mut AIToolHandler, context: &HostManager) {
+    handler.registerBuiltinTool(
+        BuiltinToolName::EdgeExecute,
+        crate::ToolExecutionManager::RegisteredToolExecutor::Asynchronous(Box::new(
+            crate::tools::EdgePortTool::EdgePortToolExecutor { io: false, runtime: handler.runtimeSupport() })),
+        ToolRegistrationVisibility::INTERNAL,
+    );
+    handler.registerBuiltinTool(
+        BuiltinToolName::IoExecute,
+        crate::ToolExecutionManager::RegisteredToolExecutor::Asynchronous(Box::new(
+            crate::tools::EdgePortTool::EdgePortToolExecutor { io: true, runtime: handler.runtimeSupport() })),
+        ToolRegistrationVisibility::INTERNAL,
+    );
     let readEnvironmentRuntimeSupport = handler.runtimeSupport();
     registerHttpTools(handler, ToolGetter::getHttpTools(context));
     if let Some(browserTools) = ToolGetter::getBrowserAutomationTools(context) {
@@ -1582,7 +1622,7 @@ fn registerPackageTools(
         let toolName = format!("{}:{}", toolPackage.name, packageTool.name);
         let mut clonedHandler = handler.clone();
         if isMcpPackage {
-            clonedHandler.registerTool(
+            clonedHandler.registerAsyncTool(
                 toolName,
                 Box::new(MCPToolExecutor::new(MCPManager::getInstance(
                     context.clone(),
@@ -1607,6 +1647,67 @@ fn toolErrorResult(tool: &AITool, error: String) -> ToolResult {
         success: false,
         result: stringResultData(""),
         error: Some(error),
+    }
+}
+
+/// Validates one switch_core target against the live route state so an invalid
+/// target fails the tool call instead of the asynchronous Binding move.
+fn switchCoreTargetError(
+    state: &crate::runtime_support::RuntimeCoreNodeRouteState,
+    targetNodeId: &str,
+) -> Option<String> {
+    let Some(node) = state.nodes.iter().find(|node| node.nodeId == targetNodeId) else {
+        return Some(format!(
+            "switch_core target is not a member of the current device space: {targetNodeId}"
+        ));
+    };
+    if !node.reachable {
+        return Some(format!(
+            "switch_core target is not currently reachable: {targetNodeId}"
+        ));
+    }
+    None
+}
+
+#[cfg(test)]
+mod switch_core_tests {
+    use super::*;
+
+    fn routeState(nodes: Vec<(&str, bool)>) -> crate::runtime_support::RuntimeCoreNodeRouteState {
+        operit_tools::runtime_support::RuntimeCoreNodeRouteState {
+            currentNodeId: "local".to_string(),
+            nodes: nodes
+                .into_iter()
+                .map(|(nodeId, reachable)| crate::runtime_support::RuntimeCoreNodeStatus {
+                    nodeId: nodeId.to_string(),
+                    displayName: nodeId.to_string(),
+                    userName: "tester".to_string(),
+                    platform: "linux".to_string(),
+                    model: String::new(),
+                    reachable,
+                    relayHops: None,
+                    relayPath: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn switch_core_accepts_reachable_members_including_direct_peers() {
+        let state = routeState(vec![("local", true), ("direct-peer", true), ("relayed", true)]);
+        assert_eq!(switchCoreTargetError(&state, "direct-peer"), None);
+        assert_eq!(switchCoreTargetError(&state, "local"), None);
+    }
+
+    #[test]
+    fn switch_core_rejects_unknown_and_unreachable_targets() {
+        let state = routeState(vec![("local", true), ("offline", false)]);
+        assert!(switchCoreTargetError(&state, "stranger")
+            .expect("unknown target must be rejected")
+            .contains("not a member"));
+        assert!(switchCoreTargetError(&state, "offline")
+            .expect("unreachable target must be rejected")
+            .contains("not currently reachable"));
     }
 }
 

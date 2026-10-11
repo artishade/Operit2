@@ -9,7 +9,7 @@ use operit_link::route_runtime::CoreRouteRuntime;
 use operit_link::{CoreCallRequest, CoreCallResponse, CoreEvent, CoreEventKind, CoreEventStream, CoreLinkClient, CoreLinkError, CoreLinkPushSession, CoreLinkSharedClient, CorePushItem, CorePushRequest, CoreValue, CoreWatchRequest, CORE_INTERNAL_TARGET, CORE_ROUTE_STREAM_SOURCE_ARGS_ARGUMENT, CORE_ROUTE_STREAM_SOURCE_METHOD_ARGUMENT, CORE_ROUTE_STREAM_SOURCE_MODE_ARGUMENT, CORE_STREAM_TARGET};
 use operit_store::CoreNodeBindingStore::{CoreNodeBindingRecord, CoreNodeBindingStore};
 use operit_store::CoreNodeIdentityStore::CoreNodeIdentityStore;
-use operit_store::CoreSpaceStore::{CoreSpace, CoreSpaceStore};
+use operit_store::CoreSpaceStore::{CoreSpace, CoreSpaceRoutePlan, CoreSpaceStore};
 use operit_store::NetworkControlStore::NetworkControlStore;
 use operit_store::PreferencesDataStore::StateFlow;
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,33 @@ use crate::RuntimeRemoteLinkService::{
 
 #[path = "peer/sync_dispatch.rs"]
 mod sync_dispatch;
+
+// An event sender may not impersonate another Edge or use Target to bypass the
+// Binding permission path. Called only after normal incoming-route validation.
+fn validateEdgeEventOrigin(
+    request: &CoreCallRequest,
+    origin: &str,
+    kind: RoutedCoreRequestKind,
+) -> Result<(), CoreLinkError> {
+    if request.target != CORE_INTERNAL_TARGET || request.methodName != "chatEdgeEvent" {
+        return Ok(());
+    }
+    let node = match &request.args {
+        CoreValue::Map(args) => args.get("nodeId"),
+        _ => None,
+    };
+    if !matches!(
+        kind,
+        RoutedCoreRequestKind::SpaceBinding | RoutedCoreRequestKind::SpaceRoute
+    ) || !matches!(node, Some(CoreValue::String(id)) if id == origin)
+    {
+        return Err(CoreLinkError::new(
+            "EDGE_EVENT_ORIGIN_DENIED",
+            "Edge event requires its authenticated Space origin",
+        ));
+    }
+    Ok(())
+}
 
 /// Reports both persisted ownership and the device currently selected by routing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -578,6 +605,23 @@ impl CoreNodeRouter {
         )
     }
 
+    /// Resolves the multi-hop route plan this device would use for one Space member.
+    ///
+    /// `None` covers the local device itself, a policy-disconnected member, a node outside
+    /// the current Space, and any member the active Peer Link graph cannot reach.
+    #[allow(non_snake_case)]
+    pub fn nodeRoutePlan(&self, targetNodeId: &str) -> Result<Option<CoreSpaceRoutePlan>, String> {
+        if targetNodeId == self.localNodeId { return Ok(None); }
+        let peers = self.nodeServices()?.peers().activePeerNodeIds().map_err(|error| error.to_string())?;
+        coreNodeRoutePlanThroughPeers(
+            &self.localNodeId,
+            &self.spaceStore,
+            &self.networkControlStore,
+            targetNodeId,
+            &peers,
+        )
+    }
+
     /// Opens the generic push session selected by generated CoreNode routing metadata.
     #[allow(non_snake_case)]
     async fn openPushSession(
@@ -966,6 +1010,44 @@ impl CoreNodeRouter {
         self.callSpaceWithOrigin(request, self.localNodeId.clone()).await
     }
 
+    /// Sends one best-effort same-Space envelope along an explicitly chosen first hop.
+    ///
+    /// Removal notices are the only caller. After one removal the target may
+    /// already be outside this device's membership view, and the hop may have
+    /// lost its transit licence while it still holds the links this device no
+    /// longer resolves. Every receiving node keeps its normal per-hop checks:
+    /// the envelope still carries this device as the origin, and each hop
+    /// validates the previous device against its own Space policy.
+    #[allow(non_snake_case)]
+    pub(crate) async fn sendSpaceEnvelopeAlongHop(
+        &self,
+        firstHop: &str,
+        targetNodeId: &str,
+        request: CoreCallRequest,
+    ) -> CoreCallResponse {
+        let requestId = request.requestId.clone();
+        let space = match self.spaceStore.initialize() {
+            Ok(space) => space,
+            Err(error) => return CoreCallResponse::err(requestId, CoreLinkError::internal(error)),
+        };
+        let ttl = match routeTtl(&space) {
+            Ok(ttl) => ttl,
+            Err(error) => return CoreCallResponse::err(requestId, error),
+        };
+        let route = RoutedCoreRequest {
+            spaceId: space.spaceId,
+            originNodeId: self.localNodeId.clone(),
+            targetNodeId: targetNodeId.to_string(),
+            ttl,
+            routeKind: RoutedCoreRequestKind::Target,
+            payload: request,
+        };
+        match self.nodeServices() {
+            Ok(services) => services.peers().call(firstHop, route).await,
+            Err(error) => CoreCallResponse::err(requestId, CoreLinkError::internal(error)),
+        }
+    }
+
     /// Allocate bindings only for explicit creation commands, after caller authorization.
     async fn prepareCreationBinding(&self, route: &crate::GeneratedSpaceRoute, key: &str,
         origin: &str) -> Result<(), CoreLinkError> {
@@ -1008,6 +1090,9 @@ impl CoreNodeRouter {
         originNodeId: String,
     ) -> CoreCallResponse {
         let requestId = request.requestId.clone();
+        if let Err(error) = validateEdgeEventOrigin(&request, &originNodeId, RoutedCoreRequestKind::SpaceBinding) {
+            return CoreCallResponse::err(requestId, error);
+        }
         let route = match crate::generated_space_call_route(&request) {
             Some(route) => route,
             None => {
@@ -1821,18 +1906,30 @@ impl CoreNodeToolRuntime for CoreNodeToolRouteRuntime {
             let profile = profiles.get(&nodeId).ok_or_else(|| {
                 format!("Device profile is missing in the current device space: {nodeId}")
             })?;
+            let plan = coreNodeRoutePlanThroughPeers(
+                &self.localNodeId,
+                &self.spaceStore,
+                &self.networkControlStore,
+                &nodeId,
+                &peers,
+            )?;
+            // Any resolved plan proves reachability, including the single-hop
+            // plan of a directly paired peer; relay metadata stays multi-hop only.
+            let reachable = nodeId == self.localNodeId || plan.is_some();
+            let (relayHops, relayPath) = match plan {
+                Some(plan) if plan.hops() > 1 => {
+                    (Some(plan.hops()), Some(plan.path.clone()))
+                }
+                _ => (None, None),
+            };
             nodes.push(RuntimeCoreNodeStatus {
                 displayName: profile.displayName.clone(),
                 userName: profile.userName.clone(),
                 platform: profile.platform.clone(),
                 model: profile.model.clone(),
-                reachable: coreNodeIsReachableThroughPeers(
-                    &self.localNodeId,
-                    &self.spaceStore,
-                    &self.networkControlStore,
-                    &nodeId,
-                    &peers,
-                )?,
+                reachable,
+                relayHops,
+                relayPath,
                 nodeId,
             });
         }
@@ -1855,34 +1952,56 @@ fn coreNodeIsReachableThroughPeers(
     if targetNodeId == localNodeId {
         return Ok(true);
     }
+    Ok(coreNodeRoutePlanThroughPeers(
+        localNodeId,
+        spaceStore,
+        networkControlStore,
+        targetNodeId,
+        peers,
+    )?
+    .is_some())
+}
+
+/// Resolves the multi-hop route plan reachable through one fixed active Peer Link snapshot.
+#[allow(non_snake_case)]
+fn coreNodeRoutePlanThroughPeers(
+    localNodeId: &str,
+    spaceStore: &CoreSpaceStore,
+    networkControlStore: &NetworkControlStore,
+    targetNodeId: &str,
+    peers: &BTreeSet<String>,
+) -> Result<Option<CoreSpaceRoutePlan>, String> {
+    if targetNodeId == localNodeId {
+        return Ok(None);
+    }
     if networkControlStore.nodeIsDisconnected(targetNodeId)? {
-        return Ok(false);
+        return Ok(None);
     }
     if !spaceStore.contains(targetNodeId.to_string())? {
-        return Ok(false);
+        return Ok(None);
     }
-    let blockedPeers = peers
-        .iter()
-        .map(|nodeId| {
-            networkControlStore
-                .nodeIsDisconnected(nodeId)
-                .map(|blocked| (nodeId.clone(), blocked))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let permittedPeers = permittedActivePeers(networkControlStore, peers)?;
+    let transitNodeIds = networkControlStore.relayNodeIds()?;
+    spaceStore.routePlanThroughPeersWithTransitNodes(
+        targetNodeId.to_string(),
+        permittedPeers,
+        transitNodeIds,
+    )
+}
+
+/// Removes peers the current Space policy has disconnected from one active Peer Link snapshot.
+#[allow(non_snake_case)]
+fn permittedActivePeers(
+    networkControlStore: &NetworkControlStore,
+    peers: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, String> {
     let mut permittedPeers = peers.clone();
-    for (nodeId, blocked) in blockedPeers {
-        if blocked {
-            permittedPeers.remove(&nodeId);
+    for nodeId in peers {
+        if networkControlStore.nodeIsDisconnected(nodeId)? {
+            permittedPeers.remove(nodeId);
         }
     }
-    let transitNodeIds = networkControlStore.relayNodeIds()?;
-    spaceStore
-        .reachableNextHopThroughPeersWithTransitNodes(
-            targetNodeId.to_string(),
-            permittedPeers,
-            transitNodeIds,
-        )
-        .map(|nextHop| nextHop.is_some())
+    Ok(permittedPeers)
 }
 
 /// Resolves the route that produced one embedded stream descriptor.
@@ -2083,6 +2202,9 @@ impl CoreNodeRouter {
         }
         match self.validateIncomingRoute(&previousNodeId, &request) {
             Ok(true) => {
+                if let Err(error) = validateEdgeEventOrigin(&request.payload, &request.originNodeId, request.routeKind) {
+                    return CoreCallResponse::err(requestId, error);
+                }
                 if request.payload.target == crate::NodeSpaceService::NODE_SPACE_CONTROL_TARGET {
                     if request.routeKind != RoutedCoreRequestKind::Target {
                         return CoreCallResponse::err(requestId, CoreLinkError::new("CONTROL_ROUTE_INVALID", "Control exchange requires an explicit same-Space target"));
@@ -3380,6 +3502,7 @@ mod tests {
                         model: "test".to_string(),
                         coreVersion: None,
                         updatedAt: 1,
+                        pairingIncarnation: None,
                     })
                     .collect(),
             )
@@ -3554,6 +3677,48 @@ mod tests {
             assert!(!router.shouldRouteWatch(method, &args).unwrap());
             assert!(router.shouldUseLocalWatchSource(method, &args).unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn core_node_route_state_reports_direct_peers_reachable() {
+        let _guard = routeTestGlobalLock().lock().await;
+        installTestRuntimeScheduler();
+        let mut router = testCoreNodeRouter("route-state-core", "route-state-peer", "route-state-chat");
+        router.spaceStore.admitRemoteMember(
+            "route-state-ghost".into(), "Ghost".into(), "test".into(), "core".into(), "1".into(),
+        ).unwrap();
+        router.networkControlStore.admitMember("route-state-ghost".into()).unwrap();
+        let peers = TestPeerService::new(
+            "route-state-core".into(),
+            "route-state-peer".into(),
+            Arc::new(TestClientEndpoint),
+        );
+        router.installNodeServices(NodeServices::new(peers)).unwrap();
+        let runtime = CoreNodeToolRouteRuntime {
+            peerServices: router.peerServices.clone(),
+            localNodeId: router.localNodeId(),
+            spaceStore: router.spaceStore.clone(),
+            networkControlStore: router.networkControlStore.clone(),
+        };
+        let state = runtime.coreNodeRouteState().unwrap();
+        assert_eq!(state.currentNodeId, "route-state-core");
+        let status = |nodeId: &str| {
+            state
+                .nodes
+                .iter()
+                .find(|node| node.nodeId == nodeId)
+                .cloned()
+                .expect("every member must appear in the route state")
+        };
+        assert!(status("route-state-core").reachable);
+        // A directly paired peer resolves a single-hop plan; it used to be folded
+        // into the multi-hop-only relay metadata and misreported as unreachable.
+        let direct = status("route-state-peer");
+        assert!(direct.reachable, "a directly paired peer must be reported reachable");
+        assert_eq!(direct.relayHops, None, "a direct peer is not relayed");
+        let ghost = status("route-state-ghost");
+        assert!(!ghost.reachable, "a member without any route must stay unreachable");
+        assert_eq!(ghost.relayHops, None);
     }
 
     #[tokio::test]
@@ -3786,7 +3951,7 @@ mod tests {
             .initializeNamed("route-test-space".to_string())
             .expect("test space must initialize");
         let networkControlStore = NetworkControlStore::new(storage.clone()).unwrap();
-        spaceStore.writeLocalDeviceProfile("Test".into(), "test".into(), "core".into(), "1".into()).unwrap();
+        spaceStore.writeLocalDeviceProfile("Test".into(), "test".into(), "core".into(), "1".into(), None).unwrap();
         networkControlStore.initializeCurrentSpace().unwrap();
         let joinedSpace = CoreSpace {
             spaceId: localSpace.spaceId.clone(),
@@ -3900,7 +4065,7 @@ mod tests {
         let mut singleton = joinedSpace.clone();
         singleton.members = vec![localNodeId.to_string()];
         spaceStore.adopt(singleton).unwrap();
-        spaceStore.writeLocalDeviceProfile("Test".into(), "test".into(), "core".into(), "1".into()).unwrap();
+        spaceStore.writeLocalDeviceProfile("Test".into(), "test".into(), "core".into(), "1".into(), None).unwrap();
         let networkControlStore = NetworkControlStore::new(storage.clone()).unwrap();
         networkControlStore.initializeCurrentSpace().unwrap();
         let members = joinedSpace.members.clone();
@@ -3999,6 +4164,17 @@ mod tests {
 
         /// Starts one asynchronous test task on the shared local Tokio executor.
         fn scheduleHostRuntimeAsyncTask(
+            &self,
+            _taskName: &str,
+            task: HostRuntimeAsyncTask,
+        ) -> HostResult<()> {
+            testHostAsyncTaskSender()
+                .send(task)
+                .map_err(|error| operit_host_api::HostError::new(error.to_string()))
+        }
+
+        /// Executes cooperative work on the host-owned asynchronous executor.
+        fn scheduleHostRuntimeCooperativeAsyncTask(
             &self,
             _taskName: &str,
             task: HostRuntimeAsyncTask,
@@ -4904,7 +5080,7 @@ mod tests {
 
         // A persistent mutation must still rebind an otherwise silent stream.
         binding.setNodeId(local.into());
-        router.spaceStore.writeLocalDeviceProfile(local.into(), "test".into(), "test".into(), "1".into()).unwrap();
+        router.spaceStore.writeLocalDeviceProfile(local.into(), "test".into(), "test".into(), "1".into(), None).unwrap();
         let next = tokio::time::timeout(Duration::from_secs(5), watch.recv()).await.unwrap().unwrap();
         assert_eq!(next.kind, CoreEventKind::Changed);
         assert!(binding.reads.load(Ordering::SeqCst) > reads);
@@ -5674,4 +5850,28 @@ mod tests {
     mod chat_input_menu_tests { use super::*; include!("router_chat_input_menu_tests.rs"); }
     mod device_space_tests { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/device_space/mod.rs")); }
 
+}
+
+#[cfg(test)]
+mod edge_event_origin_tests {
+    use super::*;
+    #[test]
+    fn edge_event_sender_is_authenticated_not_a_self_reported_node_or_target_bypass() {
+        let args =
+            operit_link::toCoreValue(serde_json::json!({"chatId":"chat","nodeId":"edge"})).unwrap();
+        let request =
+            CoreCallRequest::new("event", CORE_INTERNAL_TARGET, "chatEdgeEvent", args);
+        for kind in [
+            RoutedCoreRequestKind::SpaceBinding,
+            RoutedCoreRequestKind::SpaceRoute,
+        ] {
+            assert!(validateEdgeEventOrigin(&request, "edge", kind).is_ok());
+            assert!(validateEdgeEventOrigin(&request, "impostor", kind).is_err());
+        }
+        assert!(validateEdgeEventOrigin(&request, "edge", RoutedCoreRequestKind::Target).is_err());
+        let unrelated = CoreCallRequest::new("device", "device.status", "read", CoreValue::Null);
+        assert!(
+            validateEdgeEventOrigin(&unrelated, "edge", RoutedCoreRequestKind::Target).is_ok()
+        );
+    }
 }
